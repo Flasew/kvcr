@@ -55,6 +55,27 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     return hold
 
 
+@pytest.mark.parametrize("budget", [0, True, 1.5])
+def test_invalid_startup_budget_is_rejected(budget):
+    with pytest.raises(ValueError, match="startup_timeout_seconds"):
+        KVCR(
+            KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=budget),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(),
+        )
+
+
+def test_configured_startup_budget_reaches_progress(monkeypatch):
+    monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
+    runner = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config=KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=1),
+    )
+    assert runner._core._progress._startup_timeout_seconds == 1
+
+
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     """Observers see only stable transitions: bytes READY in a slot, then gone."""
     block_size = 16

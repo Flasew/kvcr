@@ -193,6 +193,7 @@ def test_prepare_registers_memory_before_backend_activation(
     monkeypatch, caplog, activate, level
 ) -> None:
     caplog.set_level(level, logger="kvcr.progress")
+    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
     clock_reads = []
     monkeypatch.setattr(
         progress_module,
@@ -218,6 +219,7 @@ def test_prepare_registers_memory_before_backend_activation(
         lambda: events.append("close"),
         nixl_agent_name=agent.name,
         memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
+        startup_timeout_seconds=1,
     )
     progress._nixl_agent = agent
     monkeypatch.setattr(
@@ -242,6 +244,33 @@ def test_prepare_registers_memory_before_backend_activation(
     assert progress._startup_stage == "cleanup"
     stages = [m for m in caplog.messages if "progress_startup_stage " in m]
     assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_instance_startup_budget_remains_bounded(monkeypatch, prepared) -> None:
+    """A longer default must not hide a blocked instance's shorter deadline."""
+    entered, release = threading.Event(), threading.Event()
+
+    def initialize_agent():
+        entered.set()
+        assert release.wait(5)
+
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        startup_timeout_seconds=0.001,
+    )
+    monkeypatch.setattr(progress, "_initialize_nixl", initialize_agent)
+    try:
+        with pytest.raises(RuntimeError, match="timed out after 0.001s"):
+            (progress.prepare if prepared else progress.start)()
+        assert entered.wait(1)
+    finally:
+        release.set()
+        progress.close()
+    assert progress.is_quiescent()
 
 
 def test_close_drains_queued_submissions(monkeypatch) -> None:
