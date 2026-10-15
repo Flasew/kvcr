@@ -440,9 +440,10 @@ def test_remote_completion_rejects_invalid_notification(
             op_handle, completed_indices=completed_indices, success=success
         )
     ]
-    assert _poll_until(target, bool) == [
-        (op_handle, _op_entries(dict.fromkeys(keys, False)))
-    ]
+    completed = _poll_until(target, bool)
+    assert completed == [(op_handle, _op_entries(dict.fromkeys(keys, False)))]
+    entries = completed[0][1]
+    assert entries[keys[0]] is entries[keys[1]]
     assert not _has_outstanding_operations(target)
     assert not [r for r in _key_history(caplog) if r["event"].startswith("remote_")]
 
@@ -643,9 +644,16 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     _wait_until(lambda: bool(target_control.sent))
     message = _decode_control_message(target_control.sent[0][1])
     assert message["keys"] == [other_group]
-    assert message["dst_descriptors"] == msgspec.to_builtins(
-        [target._core._normalize_descriptors(other_destination)]
-    )
+    assert message["dst_descriptors"] == [
+        [
+            {
+                "end_point_name": "target",
+                "element_index": 8,
+                "label": "",
+                "framework": True,
+            }
+        ]
+    ]
     target_agent.notifs["source"] = [_write_done_notification(mixed_handle)]
     assert _poll_until(target, bool) == [
         (mixed_handle, _op_entries({key: False, other_group: True}))
@@ -1257,7 +1265,8 @@ def test_remote_framework_dram_transfers_available_keys(
     assert source_pinning.unpins == ["pin"]
 
     target_agent.notifs["source"] = [notification]
-    assert _poll_until(target, lambda completed: bool(completed)) == [
+    completed = _poll_until(target, bool)
+    assert completed == [
         (
             op_handle,
             _op_entries(
@@ -1265,6 +1274,8 @@ def test_remote_framework_dram_transfers_available_keys(
             ),
         )
     ]
+    entries = completed[0][1]
+    assert entries[keys[completed_indices[0]]] is entries[keys[completed_indices[1]]]
     assert target.query(keys, "req") == [
         (QueryStatus.MISS, None)
         if index in missing_indices

@@ -31,8 +31,7 @@ _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
 
-@dataclass(frozen=True)
-class _MemDescriptor:
+class _MemDescriptor(msgspec.Struct, frozen=True):
     """Raw memory addresses or file offsets for FILE transfers."""
 
     mem_type: str
@@ -41,8 +40,7 @@ class _MemDescriptor:
     device_Id: int
 
 
-@dataclass(frozen=True, slots=True)
-class _TransferRef:
+class _TransferRef(msgspec.Struct, frozen=True):
     """An element in an agent's framework or KVCR-owned registered memory."""
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
