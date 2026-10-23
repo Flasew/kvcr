@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
+from . import _nvtx
 from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
@@ -287,6 +288,15 @@ class _TargetPullOp(_RemoteOp):
         return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
 
 
+@dataclass(slots=True)
+class _NvtxState:
+    requested_blocks: int = -1
+    target_incarnation: str | None = None
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
+    trace_initialized: bool = False
+    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
+
+
 @dataclass
 class _SourcePinOp(_Op):
     """Main-thread source acquisition for a pending write."""
@@ -303,6 +313,7 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
+    nvtx_state: _NvtxState | None = None
 
 
 @dataclass
@@ -329,24 +340,40 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
+    nvtx_state: _NvtxState | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
+        nvtx_state = self.nvtx_state
+        if nvtx_state is not None and not nvtx_state.trace_initialized:
+            nvtx_state.trace_initialized = True
+            if backend._nvtx is not None:
+                nvtx_state.trace = backend._nvtx.source(self, backend._kvcr)
+        trace = nvtx_state.trace if nvtx_state is not None else None
         observed_work = False
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
         if self.transfer_id is None:
-            if (
-                not backend._dangling_ops.check_source_progress()
-                or status.cancel_requested
-            ):
+            source_responsive = backend._dangling_ops.check_source_progress()
+            if not source_responsive or status.cancel_requested:
                 self.state = _SourceWriteState.NOTIFY_FAILURE
             if (
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
+                if trace is not None:
+                    if status.cancel_requested:
+                        failure_reason = _nvtx.Reason.CANCELLED
+                    elif not source_responsive:
+                        failure_reason = _nvtx.Reason.SOURCE_STALLED
+                    elif self.state is _SourceWriteState.NOTIFY_FAILURE:
+                        failure_reason = nvtx_state.failure_reason
+                    else:
+                        failure_reason = _nvtx.Reason.DEADLINE
+                    if failure_reason is _nvtx.Reason.UNKNOWN:
+                        failure_reason = trace.failure_reason
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -356,6 +383,8 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.complete_source(False, 0, reason=failure_reason)
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -368,6 +397,8 @@ class _SourceWriteOp(_RemoteOp):
                 # same handle back for a reused name. The target hears a
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
+                if trace is not None:
+                    trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
@@ -379,6 +410,8 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -395,6 +428,7 @@ class _SourceWriteOp(_RemoteOp):
                         completed_indices=self.completed_indices,
                     ),
                     capture_telemetry=backend._telemetry_enabled,
+                    trace=trace,
                 )
                 self.transfer_id = transfer_id
                 self.state = (
@@ -430,6 +464,8 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.state = _SourceWriteState.FINISHED
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.complete_source(False, 0, reason=_nvtx.Reason.CREATE_ERROR)
                 return True, True
 
         transfer_id = self.transfer_id
@@ -439,6 +475,17 @@ class _SourceWriteOp(_RemoteOp):
             status.cancel_requested or backend._kvcr._clock() >= self.deadline
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
+            if trace is not None:
+                trace.mark(
+                    "source.write.cancel_requested",
+                    once=True,
+                    status=_nvtx.Status.CANCELLED
+                    if status.cancel_requested
+                    else _nvtx.Status.TIMEOUT,
+                    reason=_nvtx.Reason.CANCELLED
+                    if status.cancel_requested
+                    else _nvtx.Reason.DEADLINE,
+                )
             observed_work = True
         cancelling = self.state is _SourceWriteState.CANCEL_PENDING
         transfer_result = backend._dangling_ops.poll_source(
@@ -479,20 +526,38 @@ class _SourceWriteOp(_RemoteOp):
             )
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
+        if trace is not None:
+            trace.complete_source(self.success, len(self.source_keys))
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
+        trace = self.nvtx_state.trace if self.nvtx_state is not None else None
         if self.transfer_id is not None:
             if (
                 progress.poll_transfer(self.transfer_id, require_completion=True)
                 is None
             ):
+                if trace is not None:
+                    trace.mark(
+                        "source.write.shutdown_unresolved",
+                        once=True,
+                        status=_nvtx.Status.UNRESOLVED,
+                        reason=_nvtx.Reason.SHUTDOWN,
+                    )
                 return False
             self.transfer_id = None
         self._backend._send_write_done(
             progress, self.remote_agent, self.op_handle, False
         )
         self._backend._dangling_ops.finish_source(self)
+        if trace is not None:
+            trace.complete_source(
+                False,
+                0,
+                reason=trace.failure_reason
+                if trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                else _nvtx.Reason.SHUTDOWN,
+            )
         return True
 
 
@@ -519,6 +584,7 @@ class _PendingPinWait:
     keys: tuple[BlockKey, ...]
     started_at: float | None
     op_ids: set[_OpId] = field(default_factory=set)
+    trace: _nvtx._PinTrace | None = None
 
 
 class _RemoteFWDram:
@@ -537,6 +603,7 @@ class _RemoteFWDram:
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
+        self._nvtx = _nvtx.create_tracer()
 
         # Main-thread state: request hints, framework pins, and progress state.
         self._closed = False
@@ -873,6 +940,8 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def initialize_progress(self, _progress: _KVCRProgress) -> None:
+        if self._nvtx is not None:
+            self._nvtx.name_progress_thread()
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
@@ -1243,6 +1312,16 @@ class _RemoteFWDram:
             dst_descriptors=dst_descriptors,
             key_layout=key_layout,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
+            nvtx_state=_NvtxState(
+                requested_blocks=len(keys),
+                target_incarnation=(
+                    payload.get("sender_incarnation")
+                    if isinstance(payload.get("sender_incarnation"), str)
+                    else None
+                ),
+            )
+            if self._nvtx is not None
+            else None,
         )
         if not self._try_local_source_write(progress, source_pin):
             self._progress_outbound.append(source_pin)
@@ -1301,6 +1380,7 @@ class _RemoteFWDram:
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
+            nvtx_state=source_pin.nvtx_state,
             _backend=self,
         )
         # Already on progress: retain cleanup ownership before starting the write.
@@ -1317,6 +1397,7 @@ class _RemoteFWDram:
         source_pin: _SourcePinOp,
         *,
         force_failure: bool = False,
+        failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN,
     ) -> None:
         kvcr = self._kvcr
         route_name, route_generation = source_pin.route
@@ -1327,6 +1408,8 @@ class _RemoteFWDram:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
+            if failure_reason is _nvtx.Reason.UNKNOWN:
+                failure_reason = _nvtx.Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.keys
         )
@@ -1414,6 +1497,8 @@ class _RemoteFWDram:
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
 
+        if source_pin.nvtx_state is not None:
+            source_pin.nvtx_state.failure_reason = failure_reason
         source_write = _SourceWriteOp(
             state=(
                 _SourceWriteState.READY_TO_WRITE
@@ -1430,6 +1515,7 @@ class _RemoteFWDram:
                 source_pin.dst_descriptors[index] for index in completed_indices
             ),
             route=source_pin.route,
+            nvtx_state=source_pin.nvtx_state,
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
@@ -1509,6 +1595,8 @@ class _RemoteFWDram:
                 and request in op.pending_pin_ids
             ]
             if not ops:
+                if wait is not None and wait.trace is not None:
+                    wait.trace.finish("cancelled", reason=_nvtx.Reason.NO_WAITERS)
                 self._discard_pin_result(result, wait.keys if wait is not None else ())
                 continue
 
@@ -1527,7 +1615,20 @@ class _RemoteFWDram:
             if result is not None and wait is not None:
                 pin_handle = self._install_framework_pin(wait.keys, result)
             self._record_pending_pin_wait(
-                wait, "success" if pin_handle is not None else "failed"
+                wait,
+                "success" if pin_handle is not None else "failed",
+                reason=(
+                    _nvtx.Reason.NONE
+                    if pin_handle is not None
+                    else _nvtx.Reason.UNKNOWN
+                    if result is None
+                    else _nvtx.Reason.INVALID_RESULT
+                ),
+                completed_blocks=(
+                    _nvtx.pin_result_blocks(result)
+                    if pin_handle is not None and wait.trace is not None
+                    else -1
+                ),
             )
             if pin_handle is not None:
                 for _, op in active_ops:
@@ -1575,7 +1676,9 @@ class _RemoteFWDram:
             len(op.pending_pin_ids),
         )
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
-        self._submit_prepared_source_write(op_id, op, force_failure=True)
+        self._submit_prepared_source_write(
+            op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+        )
 
     def _start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
@@ -1588,7 +1691,9 @@ class _RemoteFWDram:
             return
         kvcr = self._kvcr
         if kvcr._clock() >= op.deadline:
-            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+            self._submit_prepared_source_write(
+                op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+            )
             return
 
         local_sources = kvcr._claim_local_dram_sources(
@@ -1606,7 +1711,7 @@ class _RemoteFWDram:
             ):
                 return
             op.framework_acquire_attempted = True
-            framework_sources = self._acquire_framework_sources(unresolved_keys)
+            framework_sources = self._acquire_framework_sources(unresolved_keys, op=op)
             if isinstance(framework_sources, _PendingFrameworkSources):
                 op.framework_pins.update(framework_sources.framework_pins)
                 for request in framework_sources.pending_pins:
@@ -1636,10 +1741,13 @@ class _RemoteFWDram:
                 request,
             )
             return
+        new_waiter = wait.trace is not None and op_id not in wait.op_ids
         wait.op_ids.add(op_id)
         op = self._source_pin_ops.get(op_id)
         if op is not None:
             op.pending_pin_ids.add(request)
+            if new_waiter and wait.trace is not None:
+                wait.trace.waiter(op_id[1], op.op_handle)
 
     def _remove_pending_pin_state(
         self, request_id: PinRequestId
@@ -1688,6 +1796,8 @@ class _RemoteFWDram:
             if wait is None:
                 continue
             wait.op_ids.discard(op_id)
+            if wait.trace is not None:
+                wait.trace.detached(op_id[1], op.op_handle)
             if not wait.op_ids:
                 wait = self._remove_pending_pin_state(request_id)
                 if wait is not None:
@@ -1705,9 +1815,20 @@ class _RemoteFWDram:
             )
 
     def _record_pending_pin_wait(
-        self, wait: _PendingPinWait | None, result: str
+        self,
+        wait: _PendingPinWait | None,
+        result: str,
+        *,
+        reason: _nvtx.Reason | None = None,
+        completed_blocks: int = -1,
     ) -> None:
         if wait is not None:
+            if wait.trace is not None:
+                wait.trace.finish(
+                    result,
+                    reason=_nvtx.Reason.SHUTDOWN if self._closed else reason,
+                    completed_blocks=completed_blocks,
+                )
             self._kvcr._record_duration("framework_pin_wait", wait.started_at, result)
 
     def _discard_pin_result(
@@ -1728,25 +1849,53 @@ class _RemoteFWDram:
 
     # Framework pin ownership.
 
-    def _pin_framework_keys(self, keys: Collection[BlockKey]) -> PinRequestId | None:
+    def _pin_framework_keys(
+        self,
+        keys: Collection[BlockKey],
+        *,
+        op: _SourcePinOp | None = None,
+    ) -> PinRequestId | None:
         kvcr = self._kvcr
         if not keys:
             return None
         keys = tuple(keys)
         started_at = kvcr._timer()
         result = "failed"
+        trace = None
+        if self._nvtx is not None:
+            try:
+                trace = self._nvtx.begin(
+                    len(keys),
+                    source_op_id=op.op_id[1] if op is not None else 0,
+                    op_handle=op.op_handle if op is not None else 0,
+                )
+            except Exception:
+                pass
         try:
-            request = kvcr._request_pin_callback(keys)
+            pushed = trace.push() if trace is not None else False
+            try:
+                request = kvcr._request_pin_callback(keys)
+            finally:
+                if trace is not None:
+                    trace.tracer.pop(pushed)
+            if trace is not None:
+                trace.request_id = request
             if request in self._pending_pin_ops:
+                if trace is not None:
+                    trace.finish("failed", reason=_nvtx.Reason.DUPLICATE_REQUEST)
                 logger.warning("KVCR reused pin request id %d", request)
                 return None
-            wait = _PendingPinWait(request, keys, kvcr._timer())
+            wait = _PendingPinWait(request, keys, kvcr._timer(), trace=trace)
             self._pending_pin_ops[request] = wait
             for key in keys:
                 self._pending_pin_keys.setdefault(key, set()).add(request)
             result = "pending"
+            if trace is not None:
+                trace.registered(request)
             return request
         except Exception:
+            if trace is not None:
+                trace.finish("failed", reason=_nvtx.Reason.CALLBACK_ERROR)
             return None
         finally:
             kvcr._record_duration("source_acquire", started_at, result)
@@ -1801,6 +1950,8 @@ class _RemoteFWDram:
     def _acquire_framework_sources(
         self,
         keys: tuple[BlockKey, ...],
+        *,
+        op: _SourcePinOp | None = None,
     ) -> (
         tuple[dict[BlockKey, list[_TransferRef]], set[PinHandle]]
         | _PendingFrameworkSources
@@ -1826,7 +1977,7 @@ class _RemoteFWDram:
             }
             pending_pins, covered_keys = self._find_pending_pins(keys_to_pin)
             uncovered_keys = [key for key in keys_to_pin if key not in covered_keys]
-            pin_request = self._pin_framework_keys(uncovered_keys)
+            pin_request = self._pin_framework_keys(uncovered_keys, op=op)
             if pin_request is not None:
                 pending_pins.append(pin_request)
             if pending_pins:

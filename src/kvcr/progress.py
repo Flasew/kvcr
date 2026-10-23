@@ -18,6 +18,7 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
+from . import _nvtx
 from .types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class _TransferState:
     outcome: bool | None = None
     telemetry: Any | None = None
     next_release_log_at: float = 0.0
+    trace: _nvtx._LifecycleTrace | None = None
 
 
 @dataclass
@@ -217,6 +219,22 @@ class _KVCRProgress:
                 if state.outcome is not False:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
+            if state.trace is not None:
+                if xfer_state == "DONE":
+                    state.trace.mark(
+                        "nixl.done_observed",
+                        once=True,
+                        transfer_id=transfer_id,
+                        status=_nvtx.Status.SUCCESS,
+                    )
+                elif xfer_state not in ("PROC", "PEND"):
+                    state.trace.mark(
+                        "nixl.write.error",
+                        once=True,
+                        transfer_id=transfer_id,
+                        status=_nvtx.Status.FAILED,
+                        reason=_nvtx.Reason.PROGRESS_ERROR,
+                    )
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
             # its completion signal. Retain it until native access has stopped.
             # TODO: Enable timeout cancellation for NIXL backends that guarantee
@@ -252,63 +270,106 @@ class _KVCRProgress:
         backend: str | None = None,
         notif_msg: bytes = b"",
         capture_telemetry: bool = False,
+        trace: _nvtx._LifecycleTrace | None = None,
     ) -> tuple[int, bool]:
         """Submit aligned descriptors validated at ingress or constructed internally."""
-        if not local_descriptors or not remote_descriptors:
-            raise ValueError("NIXL transfer descriptors must be non-empty")
-        if not isinstance(remote_side_agent, str) or not remote_side_agent:
-            raise ValueError("NIXL remote-side agent must be non-empty")
-        agent = self.nixl_agent
-        if any(
-            isinstance(descriptors[0], _MemDescriptor)
-            and descriptors[0].mem_type == "FILE"
-            for descriptors in (local_descriptors, remote_descriptors)
-        ):
-            handle = agent.initialize_xfer(
-                operation,
-                self._make_transfer_descriptors(local_descriptors),
-                self._make_transfer_descriptors(remote_descriptors),
-                remote_side_agent,
-                notif_msg=notif_msg,
-                backends=[backend] if backend else [],
-            )
-        else:
-            local, local_indices = self._prepared_indices("", local_descriptors)
-            remote, remote_indices = self._prepared_indices(
-                remote_side_agent, remote_descriptors
-            )
-            handle = agent.make_prepped_xfer(
-                operation,
-                local,
-                local_indices,
-                remote,
-                remote_indices,
-                notif_msg=notif_msg,
-                backends=[backend] if backend else [],
-            )
-        if handle is None:
-            raise RuntimeError("NIXL transfer creation returned None")
-        self._next_transfer_id += 1
-        transfer_id = self._next_transfer_id
-        state = _TransferState(handle, remote_side_agent, capture_telemetry)
-        self._active_transfers[transfer_id] = state
-        submitted = True
+        pushed = trace.push("nixl.write.submit") if trace is not None else False
         try:
-            post_state = agent.transfer(handle)
-            if post_state == "DONE":
-                state.outcome = True
-            elif post_state == "ERR":
-                state.outcome = False
+            if not local_descriptors or not remote_descriptors:
+                raise ValueError("NIXL transfer descriptors must be non-empty")
+            if not isinstance(remote_side_agent, str) or not remote_side_agent:
+                raise ValueError("NIXL remote-side agent must be non-empty")
+            agent = self.nixl_agent
+            if any(
+                isinstance(descriptors[0], _MemDescriptor)
+                and descriptors[0].mem_type == "FILE"
+                for descriptors in (local_descriptors, remote_descriptors)
+            ):
+                handle = agent.initialize_xfer(
+                    operation,
+                    self._make_transfer_descriptors(local_descriptors),
+                    self._make_transfer_descriptors(remote_descriptors),
+                    remote_side_agent,
+                    notif_msg=notif_msg,
+                    backends=[backend] if backend else [],
+                )
+            else:
+                local, local_indices = self._prepared_indices("", local_descriptors)
+                remote, remote_indices = self._prepared_indices(
+                    remote_side_agent, remote_descriptors
+                )
+                handle = agent.make_prepped_xfer(
+                    operation,
+                    local,
+                    local_indices,
+                    remote,
+                    remote_indices,
+                    notif_msg=notif_msg,
+                    backends=[backend] if backend else [],
+                )
+            if handle is None:
+                raise RuntimeError("NIXL transfer creation returned None")
+            self._next_transfer_id += 1
+            transfer_id = self._next_transfer_id
+            state = _TransferState(
+                handle, remote_side_agent, capture_telemetry, trace=trace
+            )
+            self._active_transfers[transfer_id] = state
+            if trace is not None:
+                trace.start("nixl.write", transfer_id=transfer_id)
+            submitted = True
+            try:
+                post_state = agent.transfer(handle)
+                if post_state == "DONE":
+                    state.outcome = True
+                elif post_state == "ERR":
+                    state.outcome = False
+                    submitted = False
+                elif post_state not in ("PROC", "PEND"):
+                    submitted = False
+                    logger.warning(
+                        "NIXL transfer returned unexpected state %r", post_state
+                    )
+            except Exception as error:
+                if isinstance(error, nixlRemoteDisconnectError):
+                    self._disconnected_remote_agents.add(state.remote_side_agent)
                 submitted = False
-            elif post_state not in ("PROC", "PEND"):
-                submitted = False
-                logger.warning("NIXL transfer returned unexpected state %r", post_state)
-        except Exception as error:
-            if isinstance(error, nixlRemoteDisconnectError):
-                self._disconnected_remote_agents.add(state.remote_side_agent)
-            submitted = False
-            logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
-        return transfer_id, submitted
+                logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
+            if trace is not None:
+                if submitted:
+                    post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
+                elif state.outcome is False:
+                    post_status, post_reason = (
+                        _nvtx.Status.REJECTED,
+                        _nvtx.Reason.SUBMIT_REJECTED,
+                    )
+                else:
+                    post_status, post_reason = (
+                        _nvtx.Status.AMBIGUOUS,
+                        _nvtx.Reason.SUBMIT_AMBIGUOUS,
+                    )
+                trace.mark(
+                    "nixl.write.posted",
+                    once=True,
+                    transfer_id=transfer_id,
+                    status=post_status,
+                    reason=post_reason,
+                )
+                if state.outcome is True:
+                    trace.mark(
+                        "nixl.done_observed",
+                        once=True,
+                        transfer_id=transfer_id,
+                        status=_nvtx.Status.SUCCESS,
+                    )
+            return transfer_id, submitted
+        except Exception:
+            if trace is not None:
+                trace.reject("nixl.write.rejected", _nvtx.Reason.CREATE_ERROR)
+            raise
+        finally:
+            if trace is not None:
+                trace.tracer.pop(pushed)
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
@@ -427,11 +488,12 @@ class _KVCRProgress:
 
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:
         release_xfer = getattr(self.nixl_agent, "release_xfer_handle", None)
-        if release_xfer is None:
-            return False
         try:
-            released = release_xfer(state.handle) is not False
+            released = (
+                release_xfer is not None and release_xfer(state.handle) is not False
+            )
         except Exception:
+            released = False
             now = time.monotonic()
             if now >= state.next_release_log_at:
                 logger.warning(
@@ -440,10 +502,26 @@ class _KVCRProgress:
                     exc_info=True,
                 )
                 state.next_release_log_at = now + _RELEASE_LOG_INTERVAL_SECONDS
-            return False
         if not released:
+            if state.trace is not None:
+                state.trace.mark(
+                    "nixl.write.release_retry",
+                    detail=True,
+                    transfer_id=transfer_id,
+                    status=_nvtx.Status.UNRESOLVED,
+                    reason=_nvtx.Reason.RELEASE_ERROR,
+                )
             return False
         self._active_transfers.pop(transfer_id, None)
+        if state.trace is not None:
+            state.trace.mark(
+                "nixl.write.released",
+                once=True,
+                transfer_id=transfer_id,
+                status=_nvtx.Status.SUCCESS if state.outcome else _nvtx.Status.FAILED,
+                reason=_nvtx.Reason.NONE if state.outcome else _nvtx.Reason.UNKNOWN,
+            )
+            state.trace.end("nixl.write")
         return True
 
     def start(self) -> None:
