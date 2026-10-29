@@ -75,6 +75,7 @@ class _RequestHint:
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
+    move: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,12 +144,16 @@ class _RemoteFWDram:
         src: str | None,
         block_hashes: frozenset[int],
         request_id: str | None,
+        *,
+        move: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
             if previous is not None and previous.source != src:
-                self._request_hints[request_id] = replace(previous, failed=True)
+                self._request_hints[request_id] = replace(
+                    previous, failed=True, move=move
+                )
                 if previous.trace is not None:
                     previous.trace.mark(
                         "hint.rejected",
@@ -174,6 +179,7 @@ class _RemoteFWDram:
                     else kvcr._timer()
                 ),
                 trace=trace,
+                move=move,
             )
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
@@ -205,26 +211,34 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        source_hint: _RequestHint | None = None,
+        keys_to_move: tuple[BlockKey, ...] = (),
+        cached_keys: tuple[BlockKey, ...] = (),
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
         scope = "remote_fetch" if local_fill else "remote_deliver"
-        current_hint = (
-            self._request_hints.get(request_id) if request_id is not None else None
-        )
-        if current_hint is not None and (
-            current_hint.failed or current_hint.missing_keys.issuperset(blocks)
+        # source_hint is the move's admission snapshot, independent of later advice.
+        hint = source_hint or self._request_hints.get(request_id)
+        if (
+            hint is None
+            or hint.source is None
+            or hint.failed
+            or (source_hint is None and hint.missing_keys.issuperset(blocks))
         ):
             kvcr._record_duration(scope, started_at, "failed")
             return False
-
-        if current_hint is None or current_hint.source is None:
-            kvcr._record_duration(scope, started_at, "failed")
-            return False
-        keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
-        kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
-        if request_id is not None:
-            self._request_hints[request_id] = replace(current_hint, submitted_at=None)
+        keys = (
+            tuple(key for key in blocks if key not in hint.missing_keys)
+            if source_hint is None and hint.missing_keys
+            else tuple(blocks)
+        )
+        # Consume timing only while this exact hint is still current.
+        if hint.submitted_at is not None and (
+            source_hint is None or self._request_hints.get(request_id) is hint
+        ):
+            self._request_hints[request_id] = replace(hint, submitted_at=None)
+            kvcr._record_duration("hint_wait", hint.submitted_at, "complete")
 
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
@@ -233,17 +247,21 @@ class _RemoteFWDram:
             started_at=started_at,
             deadline=deadline,
             op_id=("target", op_handle),
-            remote_ctrl_ep=current_hint.source,
+            remote_ctrl_ep=hint.source,
             _backend=self,
             ordered_keys=keys,
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
-            request_id=request_id,
+            # Explicit-source fills must not update discarded or replacement advice.
+            request_id=request_id if source_hint is None else None,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
                 if local_fill
                 else ()
             ),
         )
+        if keys_to_move:
+            op.keys_to_move = keys_to_move
+            op.cached_keys = cached_keys
         if self._nvtx is not None:
             op.trace = self._nvtx.operation(
                 kvcr,
@@ -251,13 +269,11 @@ class _RemoteFWDram:
                 blocks,
                 request_id,
                 local_fill=local_fill,
-                hint_trace_id=current_hint.trace.trace_id
-                if current_hint.trace is not None
-                else 0,
+                hint_trace_id=hint.trace.trace_id if hint.trace is not None else 0,
                 range_name="target.remote",
             )
-            if current_hint.trace is not None:
-                current_hint.trace.mark("hint.used", op_handle=op_handle)
+            if hint.trace is not None:
+                hint.trace.mark("hint.used", op_handle=op_handle)
             if op.trace is not None:
                 op.trace.mark("target.queued")
         if logger.isEnabledFor(logging.DEBUG):
@@ -267,7 +283,7 @@ class _RemoteFWDram:
                 scope,
                 request_id,
                 op_handle,
-                current_hint.source,
+                hint.source,
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
@@ -356,6 +372,8 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
+            elif isinstance(item, _StartWrite):
+                self._kvcr._move_handler.source_cached(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -471,6 +489,14 @@ class _RemoteFWDram:
                 ):
                     continue
                 self._send_control(progress, item.endpoint, _TargetMetadata())
+            elif isinstance(item, _StartWrite):
+                # Cached copies need only source-removal intent. There is no
+                # remote write to await and no public result depends on a reply.
+                if not self._send_control(progress, item.source_control_endpoint, item):
+                    logger.warning(
+                        "KVCR cached move could not reach %s",
+                        item.source_control_endpoint,
+                    )
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
@@ -713,15 +739,27 @@ class _RemoteFWDram:
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
+        # Moves also allow empty descriptors for complete destination cache hits.
+        valid_layout = (
+            self._kvcr._move_handler.validate_request(payload)
+            if payload.move_keys
+            else len(keys) == len(dst_descriptors)
+        )
         if (
             not math.isfinite(remaining_timeout_ms)
             or remaining_timeout_ms <= 0
             or not keys
             or len(key_set := frozenset(keys)) != len(keys)
-            or len(keys) != len(dst_descriptors)
+            or not valid_layout
         ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
+            return
+
+        if payload.move_keys and not any(dst_descriptors):
+            # The destination already holds every requested key. Queue source
+            # removal only; no data transfer or completion reply is needed.
+            self._progress_outbound.append(payload)
             return
 
         remaining_timeout_ms = min(
@@ -736,7 +774,9 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
+            for descriptors in (
+                filter(None, dst_descriptors) if payload.move_keys else dst_descriptors
+            ):
                 self._kvcr._validate_descriptors(
                     descriptors,
                     regions=self._remote_agents_by_target[target_agent][2],
@@ -781,6 +821,13 @@ class _RemoteFWDram:
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
+        if payload.move_keys and not all(dst_descriptors):
+            # Some keys are already cached at the destination. Queue their
+            # source removal separately, then write only the missing keys.
+            self._progress_outbound.append(payload)
+            keys = tuple(key for key, refs in zip(keys, dst_descriptors) if refs)
+            dst_descriptors = tuple(refs for refs in dst_descriptors if refs)
+            key_set = frozenset(keys)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -811,6 +858,7 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
+        source_pin.keys_to_move = payload.move_keys
         prepared = self._try_local_source_write(progress, source_pin)
         if prepared is None:
             self._pending_local_sources.append(source_pin)
@@ -894,6 +942,9 @@ class _RemoteFWDram:
                 local_sources=sources,
                 _backend=self,
             )
+            if source_pin.keys_to_move:
+                source_write.keys_to_move = source_pin.keys_to_move
+                source_write.key_layout = source_pin.key_layout
             # Retain cleanup ownership before native submission can start.
             progress._in_flight_ops[source_write.op_id] = source_write
         except BaseException:

@@ -34,9 +34,12 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     op_handle: OpHandle
     remaining_timeout_ms: float
     keys: tuple[BlockKey, ...]
+    # Per-key destination memory pieces. Empty entries in a move identify
+    # complete target copies; completion indices cover only actual writes.
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
+    move_keys: tuple[BlockKey, ...] = ()
 
 
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
@@ -111,6 +114,11 @@ class _TargetPullOp(_RemoteOp):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
     key_layout: tuple[str, ...] = ()
+    # Requested source removals, including complete destination cache hits.
+    keys_to_move: tuple[BlockKey, ...] = ()
+    # Subset already complete locally; appended only to the wire request.
+    # These keys have no native write or completion index.
+    cached_keys: tuple[BlockKey, ...] = ()
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -170,18 +178,19 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                _StartWrite(
-                    op_handle=self.op_id[1],
-                    remaining_timeout_ms=(self.deadline - now) * 1000,
-                    source_incarnation=self.source_incarnation,
-                    keys=self.ordered_keys,
-                    dst_descriptors=self.dst_descriptors,
-                    key_layout=self.key_layout if self.local_fill else (),
-                ),
+            request = _StartWrite(
+                op_handle=self.op_id[1],
+                remaining_timeout_ms=(self.deadline - now) * 1000,
+                source_incarnation=self.source_incarnation,
+                keys=self.ordered_keys,
+                dst_descriptors=self.dst_descriptors,
+                key_layout=self.key_layout if self.local_fill else (),
+                move_keys=self.keys_to_move,
             )
+            if self.cached_keys:
+                request.keys += self.cached_keys
+                request.dst_descriptors += ((),) * len(self.cached_keys)
+            sent = backend._send_control(progress, self.remote_ctrl_ep, request)
             if not sent:
                 if trace is not None:
                     trace.reject(
@@ -375,6 +384,15 @@ class _SourceWriteOp(_RemoteOp):
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
     local_sources: tuple["_LocalDramResidency", ...] = ()
+    # Requested removals; moved_keys() selects only keys actually written.
+    keys_to_move: tuple[BlockKey, ...] = ()
+    # Complete layout, even when the write covers only missing pieces.
+    key_layout: tuple[str, ...] = ()
+
+    def moved_keys(self) -> tuple[BlockKey, ...]:
+        """Select copied keys for removal; called only after a successful move."""
+        selected = set(self.keys_to_move)
+        return tuple(key for key in self.source_keys if key in selected)
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
