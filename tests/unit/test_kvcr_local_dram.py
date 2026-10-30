@@ -76,7 +76,7 @@ def _two_pool_kvcr(
     return _new_kvcr(
         agent,
         FakePrimaryPinning(),
-        FakeBytesControl(),
+        None,  # Exercise lazy descriptor caching without remote source publication.
         config,
         local_dram=LocalDramOptions(
             [
@@ -184,6 +184,44 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
         assert removal["reason"] == "capacity_eviction"
         assert removal["key_sha256"] == hashlib.sha256(keys[0]).hexdigest()
         assert {r["event"] for r in records} >= {"ready", "inventory_accepted"}
+
+
+def test_completed_deposit_reuses_destination_descriptors(monkeypatch):
+    payload = b"a" * 8 + b"b" * 8 + b"c" * 8 + b"d" * 8 + b"e" * 8 + b"f" * 8
+    primary = ctypes.create_string_buffer(payload, len(payload))
+    local = ctypes.create_string_buffer(len(payload))
+    agent = FakeNixlAgent()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 8)]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(primary, 8, ":*")],
+    )
+    layout = [":a", ":b", ":c"]
+    keys = (BlockKey(b"reordered"), BlockKey(b"ordered"))
+    expected = _op_entries(dict.fromkeys(keys, True))
+    blocks = {
+        key: [_mem_descriptor(3 * k + i, label) for i, label in enumerate(layout)]
+        for k, key in enumerate(keys)
+    }
+    blocks[keys[0]].reverse()
+    submit = Mock(wraps=kvcr._core._progress.submit)
+    monkeypatch.setattr(kvcr._core._progress, "submit", submit)
+    deposit = kvcr.deposit(blocks, expected_layout=layout)
+    copy = submit.call_args.args[0]
+    agent.state = "DONE"
+    assert dict(_poll_until(kvcr, bool))[deposit] == expected
+    residency = kvcr._core._block_record_map[keys[1]].local_dram
+    assert all(
+        ref is dst
+        for ref, dst in zip(residency.refs, copy.dst_descriptors[3:], strict=True)
+    )
+    primary.raw = b"\0" * len(payload)
+    delivery = kvcr.deliver(blocks)
+    assert dict(_poll_until(kvcr, bool))[delivery] == expected
+    assert primary.raw == payload
 
 
 def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> None:
@@ -761,6 +799,119 @@ def test_builtin_policy_eviction_order(
     assert statuses == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 3
     if keep_claim:
         kvcr.release((second_claim,))
+
+
+def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    memory = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    local = kvcr._core._local_dram._pools
+    resident, incoming = BlockKey(b"resident"), BlockKey(b"incoming")
+    deposit = kvcr.deposit({resident: [_mem_descriptor()]})
+    assert _poll_until(kvcr, bool) == [(deposit, _op_entries({resident: True}))]
+    claimed = []
+
+    def claim_selected_victim(meta, source):
+        destination = ((progress_module._TransferRef("target", 0),),)
+        claimed.extend(local.acquire_readers((meta.block_key,), destination, ()))
+        return PlacementAction.DROP, None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kvcr._core._policy, "decide_eviction", claim_selected_victim)
+        rejected = kvcr.deposit({incoming: [_mem_descriptor(1)]})
+    try:
+        assert _poll_until(kvcr, bool) == [(rejected, _op_entries({incoming: False}))]
+        assert len(agent.transfers) == 1
+        assert claimed[0][0].source_readers == 1
+        assert memory.raw == b"a" * 16
+        assert kvcr.query((resident,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    finally:
+        local.release_readers((resident,), (claimed[0][0],), success=True)
+
+    replacement = kvcr.deposit({incoming: [_mem_descriptor(1)]})
+    assert _poll_until(kvcr, bool) == [(replacement, _op_entries({incoming: True}))]
+    assert memory.raw == b"b" * 16
+
+
+@pytest.mark.parametrize(
+    "completion_order", ["reader_first", "spill_first", "during_admission"]
+)
+def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
+    completion_order,
+    monkeypatch,
+):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
+    memory = ctypes.create_string_buffer(48)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        policy=LRUPolicy(),
+    )
+    local = kvcr._core._local_dram._pools
+    retiring, recent, cold, incoming = map(
+        BlockKey, (b"retiring", b"recent", b"cold", b"incoming")
+    )
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    for index, key in enumerate((retiring, recent, cold)):
+        now = index / 10
+        deposit = kvcr.deposit({key: [_mem_descriptor(index)]})
+        assert _poll_until(kvcr, bool) == [(deposit, _op_entries({key: True}))]
+
+    destination = ((progress_module._TransferRef("target", 0),),)
+    retiring_source = local.acquire_readers((retiring,), destination, ())
+    recent_source = local.acquire_readers((recent,), destination, ())
+    assert retiring_source and recent_source
+    # A pending spill holds the retirement and queues a two-slot deposit.
+    local.acquire_sources((retiring,))
+    local._capacity_eviction_key = retiring
+    blocks = {incoming: [_mem_descriptor(0), _mem_descriptor(1)]}
+    deposit = kvcr.deposit(blocks)
+    assert list(kvcr.poll_completed()) == []
+    local.retire_sources((retiring,))
+    if completion_order == "spill_first":
+        local.release_sources((retiring,))
+        kvcr.align_sequence([retiring])
+
+    now = 0.3
+    local.release_readers((retiring,), (retiring_source[0][0],), success=False)
+    if completion_order == "during_admission":
+        decide_ingest = kvcr._core._policy.decide_ingest
+
+        def complete_reader(*args, **kwargs):
+            # Finish after the admission's initial completion drain.
+            monkeypatch.setattr(kvcr._core._policy, "decide_ingest", decide_ingest)
+            local.release_readers((recent,), (recent_source[0][0],), success=True)
+            return decide_ingest(*args, **kwargs)
+
+        monkeypatch.setattr(kvcr._core._policy, "decide_ingest", complete_reader)
+    else:
+        local.release_readers((recent,), (recent_source[0][0],), success=True)
+    if completion_order != "spill_first":
+        local.release_sources((retiring,))
+    duplicate = kvcr.deposit(blocks)
+    completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
+    assert completed == dict.fromkeys(
+        (deposit, duplicate), _op_entries({incoming: True})
+    )
+    assert kvcr.query((recent, cold, incoming)) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
 
 
 @pytest.mark.parametrize(

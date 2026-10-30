@@ -6,7 +6,6 @@ import ctypes
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -26,6 +25,7 @@ from _kvcr_test_utils import (
     _new_kvcr,
     _op_entries,
     _poll_until,
+    _recovered_record,
     _start_write_message,
     _wait_until,
 )
@@ -33,7 +33,7 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
-from kvcr.backends.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
+from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
 from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.runtime.core import _BlockRecord, _KVCRCore
@@ -87,9 +87,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
-def test_local_source_starts_inline_and_holds_its_slot(
-    transfer_state, recovered, monkeypatch
-):
+def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -127,22 +125,25 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 {
                     key: _BlockRecord(
                         local_dram=_LocalDramResidency(
-                            [("", 0), (":b", 1), (":c", 2)], _LocalDramState.READY
+                            [("", 0), (":b", 1), (":c", 2)],
+                            _LocalDramState.READY,
+                            refs=tuple(
+                                _TransferRef("old-agent", i, label, framework=False)
+                                for i, label in enumerate(("", ":b", ":c"))
+                            ),
                         )
                     )
                 },
             )
         else:
-            deposit = source.deposit({key: descriptors})
+            deposit = source.deposit(
+                {key: [descriptors[0], descriptors[2]]},
+                expected_layout=["", ":b", ":c"],
+            )
             assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         prior_transfers = len(agent.xfers)
-        local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
-        make_ref = Mock(wraps=local._pools._descriptor)
-        monkeypatch.setattr(local._pools, "_descriptor", make_ref)
-        callbacks.clear()
-        agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
         request.update(
             target_regions=(
@@ -163,37 +164,43 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 [_TransferRef("target", i, label) for i, label in enumerate((":c", ""))]
             ],
         )
-        preparing, resume = threading.Event(), threading.Event()
-        initialize_write = _SourceWriteOp.__init__
-
-        def pause_write_preparation(op, *args, **kwargs):
-            preparing.set()
-            assert resume.wait(timeout=2)
-            initialize_write(op, *args, **kwargs)
-
+        if not recovered:
+            # Ready pieces still read through the caller until the block is complete.
+            control.incoming.extend(
+                [
+                    msgspec.msgpack.encode(dict(request, op_handle=11)),
+                    _write_probe_message(99),
+                ]
+            )
+            _wait_until(lambda: bool(control.sent))
+            assert len(agent.xfers) == prior_transfers
+            _poll_until(
+                source,
+                lambda _: (
+                    len(agent.released_xfers) == prior_transfers + 1
+                    and not _has_outstanding_operations(source)
+                ),
+            )
+            assert [
+                ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+            ] == [b"c" * 16, b"a" * 16]
+            deposit = source.deposit({key: descriptors[1:2]})
+            assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+            prior_transfers = len(agent.xfers)
+        callbacks.clear()
+        agent.state = transfer_state
         with (
-            patch.object(_SourceWriteOp, "__init__", pause_write_preparation),
             # A resident-source request must not re-enter the submission queue.
             patch.object(source._core._progress, "submit", side_effect=AssertionError),
+            source._core._state_lock,
         ):
             control.incoming.append(msgspec.msgpack.encode(request))
-            try:
-                assert preparing.wait(timeout=1)
-                # Claims and dependencies protect the source while P builds the
-                # write, but M must be able to acquire the metadata lock already.
-                assert source._core._state_lock.acquire(blocking=False)
-                try:
-                    record = source._core._block_record_map[key]
-                    assert record.local_dram.claim_count == 1
-                    assert record.in_flight_ops
-                finally:
-                    source._core._state_lock.release()
-            finally:
-                resume.set()
             _wait_until(lambda: len(agent.xfers) == prior_transfers + 1)
+        if transfer_state == "PROC":
+            assert residency.source_readers == 1
 
         # The peer request must be served without another caller-side poll.
-        assert residency.claim_count == 1
+        assert residency.claim_count == 0
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [
@@ -202,7 +209,6 @@ def test_local_source_starts_inline_and_holds_its_slot(
         ]
         assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
-        assert make_ref.call_count == 2
         assert not source._core._remote_fw_dram._sources._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
@@ -211,8 +217,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == prior_transfers + 1)
-        assert residency.claim_count == 1  # Native completion does not release it.
-        assert _poll_until(source, lambda _: residency.claim_count == 0) == []
+        assert _poll_until(source, lambda _: residency.source_readers == 0) == []
         assert not source._core._local_dram_sources_by_op
 
         # The caller-queued path reuses the same parts without pinning the framework.
@@ -228,7 +233,6 @@ def test_local_source_starts_inline_and_holds_its_slot(
                     and residency.claim_count == 0
                 ),
             )
-        assert make_ref.call_count == 2
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
     finally:
@@ -342,7 +346,7 @@ def test_local_source_waits_for_declared_pieces(
 @pytest.mark.parametrize(
     "outcome", ["write", "framework", "deadline", "cancel", "route", "shutdown"]
 )
-def test_local_source_retries_after_fill_publication(outcome):
+def test_local_source_retries_after_reader_contention(outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
@@ -356,73 +360,53 @@ def test_local_source_retries_after_fill_publication(outcome):
     )
     now = 0.0
     source._core._clock = lambda: now
-    local = source._core._local_dram
+    local = source._core._local_dram._pools
     backend = source._core._remote_fw_dram
     key = BlockKey(b"local")
     requested_key = BlockKey(b"framework-only") if outcome == "framework" else key
-    publishing, resume = threading.Event(), threading.Event()
-    make_evictable = local._pools._make_evictable
-
-    def pause_publication(key):
-        # READY is already set, but the caller's fill transaction is unfinished.
-        publishing.set()
-        assert resume.wait(timeout=2)
-        make_evictable(key)
-
     try:
         agent.state = "DONE"
         deposit = source.deposit({key: [descriptor]})
-        _wait_until(lambda: not source._core._progress._completed.empty())
-        with (
-            patch.object(
-                local._pools, "_make_evictable", side_effect=pause_publication
-            ),
-            ThreadPoolExecutor(max_workers=1) as caller,
-        ):
-            completion = caller.submit(source.poll_completed)
-            try:
-                assert publishing.wait(timeout=1)
-                agent.state = "PROC"
-                control.incoming.extend(
-                    [
-                        _start_write_message(12, requested_key, target_agent="target"),
-                        _write_probe_message(99),
-                    ]
+        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        agent.state = "PROC"
+        with local._source_state.lock:
+            control.incoming.extend(
+                [
+                    _start_write_message(12, requested_key, target_agent="target"),
+                    _write_probe_message(99),
+                ]
+            )
+            _wait_until(
+                lambda: any(
+                    _decode_control_message(raw).get("type") == "write_probe_ack"
+                    for _, raw in control.sent
                 )
-                _wait_until(
-                    lambda: any(
-                        _decode_control_message(raw).get("type") == "write_probe_ack"
-                        for _, raw in control.sent
-                    )
-                )
-                _wait_until(lambda: bool(backend._pending_local_sources))
+            )
+            _wait_until(lambda: bool(backend._pending_local_sources))
+            assert len(agent.xfers) == 1
+            assert source._core._block_record_map[key].local_dram.claim_count == 0
+            if outcome == "deadline":
+                now = 2.0
+            elif outcome == "cancel":
+                control.incoming.append(_write_probe_message(12))
+            elif outcome == "route":
+                backend._route_generation["target"] = 1
+            elif outcome == "shutdown":
+                source._core._progress._submissions.put(_STOP)
+            if outcome not in ("write", "framework"):
+                _wait_until(lambda: bool(agent.sent_notifs))
+                assert _decode_notif(agent.sent_notifs[0][1]) == {
+                    "type": "write_done",
+                    "op_handle": 12,
+                    "success": False,
+                }
                 assert len(agent.xfers) == 1
-                assert source._core._block_record_map[key].local_dram.claim_count == 0
-                if outcome == "deadline":
-                    now = 2.0
-                elif outcome == "cancel":
-                    control.incoming.append(_write_probe_message(12))
-                elif outcome == "route":
-                    backend._route_generation["target"] = 1
-                elif outcome == "shutdown":
-                    source._core._progress._submissions.put(_STOP)
-                if outcome not in ("write", "framework"):
-                    _wait_until(lambda: bool(agent.sent_notifs))
-                    assert _decode_notif(agent.sent_notifs[0][1]) == {
-                        "type": "write_done",
-                        "op_handle": 12,
-                        "success": False,
-                    }
-                    assert len(agent.xfers) == 1
-            finally:
-                resume.set()
-            assert completion.result(timeout=1) == [(deposit, _op_entries({key: True}))]
 
         # Ready local sources retry without another caller-side poll.
         if outcome == "write":
             _wait_until(lambda: len(agent.xfers) == 2)
-            assert source._core._block_record_map[key].local_dram.claim_count == 1
-            assert local._pools.telemetry_state()["local_g2_evictable_slots"] == 0
+            assert source._core._block_record_map[key].local_dram.source_readers == 1
+            assert local.telemetry_state()["local_g2_evictable_slots"] == 0
         elif outcome == "framework":
             assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
         assert pinning.searches == (
@@ -435,7 +419,6 @@ def test_local_source_retries_after_fill_publication(outcome):
         assert source._core._outstanding_operations == 0
         assert source._core._block_record_map[key].local_dram.claim_count == 0
     finally:
-        resume.set()
         agent.state = "DONE"
         source.close()
     assert not backend._pending_local_sources
@@ -777,8 +760,10 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
 
 
 @pytest.mark.parametrize("failure", ["initialize", "error", "exception", "async"])
+@pytest.mark.parametrize("local_source", [False, True], ids=["framework", "local"])
 def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     failure: str,
+    local_source: bool,
 ) -> None:
     """Every source-transfer failure reports failure and releases its state."""
 
@@ -798,9 +783,23 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     pinning = FakePrimaryPinning()
     control = FakeBytesControl()
     key = BlockKey(b"k0")
-    control.incoming.append(_start_write_message(5, key))
-    kvcr = _new_kvcr(source_agent, pinning, control, name="source")
+    memory = ctypes.create_string_buffer(16)
+    kvcr = _new_kvcr(
+        source_agent,
+        pinning,
+        control,
+        name="source",
+        local_dram=(
+            LocalDramOptions([("", ctypes.addressof(memory), len(memory))])
+            if local_source
+            else None
+        ),
+    )
+    if local_source:
+        install_recovery_records(kvcr._core, {key: _recovered_record(g2=[("", 0)])})
+        residency = kvcr._core._block_record_map[key].local_dram
     kvcr._core._clock = lambda: 0.0  # Failure must come from ERR, not a timeout.
+    control.incoming.append(_start_write_message(5, key))
 
     if failure == "async":
         assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
@@ -811,9 +810,20 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         assert _decode_notif(source_agent.sent_notifs[0][1])["terminal"] is False
         assert pinning.unpins == []
         assert source_agent.released_xfers == []
+        if local_source:
+            assert residency.source_readers == 1
+            assert kvcr._core._local_dram._pools.source_operations == 1
         source_agent.state = "DONE"
-    assert _poll_until(kvcr, lambda _: pinning.unpins == ["pin"]) == []
+    completed = _poll_until(
+        kvcr,
+        lambda _: source_agent.sent_notifs and not _has_outstanding_operations(kvcr),
+    )
+    assert completed == []
 
+    assert pinning.unpins == ([] if local_source else ["pin"])
+    if local_source:
+        assert residency.source_readers == 0
+        assert kvcr._core._local_dram._pools.source_operations == 0
     assert source_agent.transfers == ([] if failure == "initialize" else [1])
     agent_name, notif = source_agent.sent_notifs[-1]
     assert agent_name == "remote-1"
@@ -937,23 +947,37 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
         kvcr.close()
 
 
-def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
+@pytest.mark.parametrize("local_source", [False, True], ids=["framework", "local"])
+def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_source):
     now = 0.0
     agent, control, errors, done = FakeNixlAgent(), FakeBytesControl(), [], set()
     agent.check_xfer_state = lambda handle: "DONE" if handle in done else "PROC"
+    memory = ctypes.create_string_buffer(16)
     source = _new_kvcr(
         agent,
         FakePrimaryPinning(),
         control,
         name="source",
         on_resilience_event=errors.append,
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=(
+            LocalDramOptions([("", ctypes.addressof(memory), len(memory))])
+            if local_source
+            else None
+        ),
     )
     source._core._clock = lambda: now
     key = BlockKey(b"shared")
+    if local_source:
+        install_recovery_records(source._core, {key: _recovered_record(g2=[("", 0)])})
+        residency = source._core._block_record_map[key].local_dram
     try:
         for target in ("target-a", "target-b"):
             control.incoming.append(_start_write_message(12, key, target_agent=target))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
+        if local_source:
+            assert residency.source_readers == 2
+            assert source._core._local_dram._pools.source_operations == 2
         now = 5.0
         _poll_until(source, lambda _: len(errors) == 2)
         pending = {error.op_handle for error in errors}
@@ -964,7 +988,8 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
             == errors[1].source_blocks
             == {key: [_mem_descriptor(end_point_name="source")]}
         )
-        assert errors[0].source_owners == errors[1].source_owners == {key: "framework"}
+        owner = "kvcr" if local_source else "framework"
+        assert errors[0].source_owners == errors[1].source_owners == {key: owner}
         for native_handle in (1, 2):
             done.add(native_handle)
             _poll_until(source, lambda _: len(errors) == 2 + native_handle)
@@ -974,13 +999,29 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
             assert event.source_owners == errors[0].source_owners
             pending.remove(event.op_handle)
             assert len(pending) == 2 - native_handle
+            if local_source:
+                assert residency.source_readers == 2 - native_handle
+                assert (
+                    source._core._local_dram._pools.source_operations
+                    == 2 - native_handle
+                )
+                if native_handle == 1:
+                    replacement = BlockKey(b"replacement")
+                    blocked = source.deposit(
+                        {replacement: [_mem_descriptor(end_point_name="source")]}
+                    )
+                    assert source.poll_completed() == [
+                        (blocked, _op_entries({replacement: False}))
+                    ]
+                    assert len(agent.xfers) == 2
         assert not _has_outstanding_operations(source)
     finally:
         done.update((1, 2))
         source.close()
 
 
-def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
+@pytest.mark.parametrize("mixed", [False, True])
+def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
     now = 0.0
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
@@ -997,10 +1038,11 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     source._core._clock = lambda: now
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
-    expected_sources = {
-        key: [descriptor],
-        framework_hit: [descriptor],
-    }
+    expected_sources = {key: [descriptor]}
+    expected_owners = {key: "kvcr"}
+    if mixed:
+        expected_sources[framework_hit] = [descriptor]
+        expected_owners[framework_hit] = "framework"
     try:
         agent.state = "DONE"
         deposit = source.deposit({key: [descriptor]})
@@ -1009,9 +1051,9 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         payload = msgspec.msgpack.decode(
             _start_write_message(12, key, target_agent="target")
         )
-        payload["keys"] = [key, missing, framework_hit]
+        payload["keys"] = [key, missing, framework_hit] if mixed else [key]
         payload["dst_descriptors"] = [
-            [_TransferRef("target", index)] for index in range(3)
+            [_TransferRef("target", index)] for index in range(len(payload["keys"]))
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -1023,14 +1065,15 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         assert list(source.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
         ]
-        assert source._core._block_record_map[key].local_dram.claim_count == 1
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.claim_count + residency.source_readers == 1
         agent.state = "DONE"
         assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
-        assert source._core._block_record_map[key].local_dram.claim_count == 0
+        assert residency.claim_count + residency.source_readers == 0
         assert errors[1].source_blocks == expected_sources
         for error in errors:
-            assert error.source_owners == {key: "kvcr", framework_hit: "framework"}
+            assert error.source_owners == expected_owners
             assert error.destination_regions is error.destination_owner is None
         deposit = source.deposit({replacement: [descriptor]})
         assert _poll_until(source, bool) == [

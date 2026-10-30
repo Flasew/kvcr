@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Local DRAM pool allocation, residency, claims, and eviction."""
 
+import queue
+import threading
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -64,7 +66,8 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
 
     Reserved pieces become readable only after successful copies. Once all
     pieces are readable, pending_labels is None; writers is also None when
-    no copies are in flight. refs caches committed physical-slot references.
+    no copies are in flight. refs is sparse until a completed residency is
+    published for remote reads, then holds its immutable descriptor tuple.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -77,11 +80,14 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     writers: list[int] | None = None
     remote_indices: tuple[int, ...] | None = None
     remote_cancelled: bool = False
-    refs: dict[int, _TransferRef] = msgspec.field(default_factory=dict)
+    refs: dict[int, _TransferRef] | tuple[_TransferRef, ...] = msgspec.field(
+        default_factory=dict
+    )
     indices_by_label: dict[str, int | None] | None = None
     _layout: tuple[str, ...] | None = None
     _pool_counts: tuple[tuple[str, int], ...] | None = None
     _cached_size: int | None = None
+    source_readers: int = 0  # Includes completed reads awaiting access accounting.
 
     def __post_init__(self) -> None:
         self.slots = tuple(self.slots)
@@ -163,6 +169,20 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
         )
 
 
+class _SourceState:
+    """Reader state shared with progress; completions return work to the caller."""
+
+    def __init__(self) -> None:
+        # Owner paths take _state_lock before this lock; progress takes only this.
+        self.lock = threading.Lock()
+        self.ready: dict[BlockKey, _LocalDramResidency] = {}
+        self.active: dict[BlockKey, _LocalDramResidency] = {}
+        self.operations = 0
+        self.completions: queue.SimpleQueue[
+            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool]
+        ] = queue.SimpleQueue()
+
+
 class _LocalDramPools:
     """Own pool slots and claims independently of pending operations."""
 
@@ -181,6 +201,8 @@ class _LocalDramPools:
             raise ValueError("local DRAM NIXL backend must be non-empty")
 
         self._kvcr = kvcr
+        self._source_state = _SourceState()
+        self._draining_source_completions = False
         self._regions: dict[str, tuple[int, int, int]] = {}
         self._free_slots: dict[str, deque[int]] = {}
         for (pool_name, address, length), (_, slot_size) in zip(
@@ -226,6 +248,139 @@ class _LocalDramPools:
             for name, (address, length, size) in self._regions.items()
         )
 
+    @property
+    def source_operations(self) -> int:
+        state = self._source_state
+        with state.lock:
+            return state.operations
+
+    def _publish_source(
+        self,
+        key: BlockKey,
+        residency: _LocalDramResidency,
+        refs: tuple[_TransferRef, ...] | None = None,
+    ) -> None:
+        if self._kvcr.framework_control is None or residency.pending_labels:
+            return
+        if refs is None:
+            refs = (
+                self.source_refs(residency, range(len(residency.slots)))
+                if residency.refs
+                else tuple(self._descriptors(residency.slots))
+            )
+        state = self._source_state
+        with state.lock:
+            if (
+                residency.state is _LocalDramState.READY
+                and not residency.retire_on_release
+            ):
+                residency.refs = refs
+                state.ready[key] = residency
+
+    def acquire_readers(
+        self,
+        keys: tuple[BlockKey, ...],
+        destinations: tuple[tuple[_TransferRef, ...], ...],
+        key_layout: tuple[str, ...],
+    ) -> tuple[tuple[_LocalDramResidency, tuple[_TransferRef, ...]], ...] | None:
+        """Claim every requested piece; None retries contention, () uses the owner."""
+        state = self._source_state
+        if not state.lock.acquire(blocking=False):
+            return None
+        try:
+            claims = []
+            for key, destination in zip(keys, destinations):
+                residency = state.ready.get(key)
+                if residency is None:
+                    return ()
+                available = cast(tuple[_TransferRef, ...], residency.refs)
+                if key_layout and key_layout != residency.key_layout:
+                    return ()
+                requested = [ref.label for ref in destination]
+                if residency.layout == tuple(requested):
+                    refs = available
+                else:
+                    indices = _layout_indices(
+                        residency.layout,
+                        requested,
+                        indices_by_label=residency.indices_by_label,
+                    )
+                    if indices is None:
+                        return ()
+                    refs = tuple(available[index] for index in indices)
+                claims.append((residency, refs))
+            result = tuple(claims)
+            for key, (residency, _) in zip(keys, result):
+                residency.source_readers += 1
+                state.active[key] = residency
+            state.operations += 1
+            return result
+        finally:
+            state.lock.release()
+
+    def release_readers(
+        self,
+        keys: tuple[BlockKey, ...],
+        sources: tuple[_LocalDramResidency, ...],
+        *,
+        success: bool,
+    ) -> None:
+        """Queue reader release; retain eviction protection until access accounting."""
+        state = self._source_state
+        with state.lock:
+            state.operations -= 1
+            state.completions.put((keys, sources, success))
+
+    def _drain_source_completions(self) -> None:
+        if self._draining_source_completions:
+            return
+        self._draining_source_completions = True
+        state = self._source_state
+        completions = state.completions
+        freed = False
+        try:
+            while True:
+                try:
+                    keys, sources, success = completions.get_nowait()
+                except queue.Empty:
+                    break
+                if success:
+                    self._kvcr._record_access(keys)
+                with state.lock:
+                    for key, residency in zip(keys, sources):
+                        if residency.source_readers <= 0:
+                            raise RuntimeError(
+                                "local DRAM source reader ownership lost"
+                            )
+                        residency.source_readers -= 1
+                        if not residency.source_readers:
+                            state.active.pop(key)
+                for key, residency in zip(keys, sources):
+                    record = self._kvcr._block_record_map.get(key)
+                    if (
+                        record is not None
+                        and record.local_dram is residency
+                        and not residency.claim_count
+                    ):
+                        freed |= self._after_last_claim(key, residency)
+        finally:
+            self._draining_source_completions = False
+        if freed and not self._kvcr._closed:
+            self._resume_capacity_waiters()
+
+    def _reclaimable_slots(self) -> dict[str, int]:
+        slots = {
+            name: len(free) + self._evictable_slots[name]
+            for name, free in self._free_slots.items()
+        }
+        state = self._source_state
+        with state.lock:
+            for key, residency in state.active.items():
+                if self._evictable.score(key) is not None:
+                    for pool, count in residency.pool_counts:
+                        slots[pool] -= count
+        return slots
+
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
@@ -239,7 +394,7 @@ class _LocalDramPools:
         seen every block first.
         """
         occupied = {pool_name: set() for pool_name in self._regions}
-        for record in records.values():
+        for key, record in records.items():
             residency = record.local_dram
             if residency is None:
                 continue
@@ -270,7 +425,9 @@ class _LocalDramPools:
                 raise ValueError("invalid local DRAM recovery layout")
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
+            residency.refs = {}
             residency.prepare_label_index()
+            self._publish_source(key, residency)
         self._free_slots = {
             pool_name: deque(
                 slot
@@ -301,7 +458,8 @@ class _LocalDramPools:
             "local_g2_total_slots": total_slots,
             "local_g2_free_slots": free_slots,
             "local_g2_allocated_slots": total_slots - free_slots,
-            "local_g2_evictable_slots": sum(self._evictable_slots.values()),
+            "local_g2_evictable_slots": sum(self._reclaimable_slots().values())
+            - free_slots,
         }
 
     def release(self, handles: Collection[ReleaseHandle]) -> list[ReleaseResult]:
@@ -321,7 +479,6 @@ class _LocalDramPools:
         self,
         keys: Collection[BlockKey],
         *,
-        notify_capacity: bool = True,
         allow_filling: bool = False,
     ) -> dict[BlockKey, _LocalDramResidency]:
         sources: dict[BlockKey, _LocalDramResidency] = {}
@@ -337,18 +494,20 @@ class _LocalDramPools:
                 continue
             self._acquire_claim(key, residency)
             sources[key] = residency
-        if notify_capacity:
-            self._update_capacity_pressure()
+        self._update_capacity_pressure()
         return sources
 
     def source_refs(
-        self, residency: _LocalDramResidency, indices: list[int]
+        self, residency: _LocalDramResidency, indices: Collection[int]
     ) -> tuple[_TransferRef, ...]:
+        cached = residency.refs
+        if isinstance(cached, tuple):
+            return tuple(cached[index] for index in indices)
         refs = []
         for index in indices:
-            ref = residency.refs.get(index)
+            ref = cached.get(index)
             if ref is None:
-                ref = residency.refs[index] = self._descriptor(*residency.slots[index])
+                ref = cached[index] = self._descriptor(*residency.slots[index])
             refs.append(ref)
         return tuple(refs)
 
@@ -363,6 +522,7 @@ class _LocalDramPools:
 
     def retire_sources(self, keys: Collection[BlockKey]) -> None:
         """Retire claimed sources when their final internal claim is released."""
+        state = self._source_state
         for key in dict.fromkeys(keys):
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
@@ -372,7 +532,9 @@ class _LocalDramPools:
                 or residency.claim_count <= 0
             ):
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
-            residency.retire_on_release = True
+            with state.lock:
+                residency.retire_on_release = True
+                state.ready.pop(key, None)
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:
         """Stop blocking local admission on an eviction that will not land.
@@ -385,7 +547,8 @@ class _LocalDramPools:
             self._capacity_eviction_key = None
 
     def close(self) -> None:
-        # Policy state ends with KVCR; teardown emits no per-block removals.
+        # Drain pending source cleanup before dropping public claims.
+        self._drain_source_completions()
         self._public_claims.clear()
 
     def _new_public_claim(
@@ -430,32 +593,44 @@ class _LocalDramPools:
             raise RuntimeError(f"invalid local DRAM claim for {key!r}")
         residency.claim_count -= 1
         if residency.claim_count == 0:
-            if residency.state is not _LocalDramState.READY:
+            self._after_last_claim(key, residency)
+
+    def _after_last_claim(self, key: BlockKey, residency: _LocalDramResidency) -> bool:
+        state = self._source_state
+        record = self._kvcr._block_record_map[key]
+        retiring = (
+            residency.state is not _LocalDramState.READY or residency.retire_on_release
+        )
+        with state.lock:
+            if retiring:
+                state.ready.pop(key, None)
+            if residency.source_readers:
+                return False
+            if retiring:
+                # Withdraw the source before its slots can be reused.
                 record.local_dram = None
-                self._free(residency.slots)
-                self._kvcr._prune_block_record(key)
-                self._resume_capacity_waiters()
-                return
-            if residency.retire_on_release:
-                if self._kvcr._key_history_enabled:
-                    self._kvcr._log_key_history(
-                        "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
-                    )
-                record.local_dram = None
-                self._residency_observer(key, record)
-                self._free(residency.slots)
-                self.abandon_capacity_eviction(key)
-                self._kvcr._on_remove(
-                    self._kvcr._block_meta(key, record, self._size_bytes(residency))
+        if not retiring:
+            self._make_evictable(key)
+            return False
+        if residency.state is _LocalDramState.READY:
+            if self._kvcr._key_history_enabled:
+                self._kvcr._log_key_history(
+                    "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
                 )
-                if not residency.pending_labels:
-                    self._kvcr._publish_inventory(
-                        (key,), CacheTier.LOCAL_G2, removed=True
-                    )
-                self._kvcr._prune_block_record(key)
-                self._resume_capacity_waiters()
-            else:
-                self._make_evictable(key)
+            self._residency_observer(key, record)
+            self._free(residency.slots)
+            self.abandon_capacity_eviction(key)
+            self._kvcr._on_remove(
+                self._kvcr._block_meta(key, record, self._size_bytes(residency))
+            )
+            if not residency.pending_labels:
+                self._kvcr._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
+        else:
+            self._free(residency.slots)
+        self._kvcr._prune_block_record(key)
+        if not self._kvcr._closed and not self._draining_source_completions:
+            self._resume_capacity_waiters()
+        return True
 
     def _allocate_slots(
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
@@ -486,6 +661,7 @@ class _LocalDramPools:
             }
 
         deficient = short()
+        state = self._source_state
         with closing(self._evictable.candidates(protected)) as candidates:
             while deficient:
                 key = next(candidates, None)
@@ -502,6 +678,9 @@ class _LocalDramPools:
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
                 if deficient.isdisjoint(pool for pool, _ in residency.pool_counts):
                     continue
+                with state.lock:
+                    if residency.source_readers:
+                        continue
                 size_bytes = self._size_bytes(residency)
                 decision, eviction_pending = self._kvcr._decide_eviction(
                     self._kvcr._block_meta(key, record, size_bytes),
@@ -521,6 +700,13 @@ class _LocalDramPools:
                     freed[pool] += count
                 deficient = short()
 
+        with state.lock:
+            # Policy runs unlocked; a source can claim a selected victim meanwhile.
+            if any(residency.source_readers for _, _, residency, _ in victims):
+                # Accept transient admission failure to avoid another policy scan.
+                return None, [], False
+            for key, _, _, _ in victims:
+                state.ready.pop(key, None)
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
             if self._kvcr._key_history_enabled:
@@ -550,6 +736,7 @@ class _LocalDramPools:
             residency is None
             or residency.state is not _LocalDramState.READY
             or residency.claim_count
+            or residency.retire_on_release
             or residency.pending_labels
         ):
             return
@@ -605,9 +792,4 @@ class _LocalDramPools:
     def _update_capacity_pressure(self) -> None:
         if self._kvcr._capacity_needed_callback is None:
             return
-        self._kvcr._update_capacity_pressure(
-            {
-                name: len(slots) + self._evictable_slots[name]
-                for name, slots in self._free_slots.items()
-            }
-        )
+        self._kvcr._update_capacity_pressure(self._reclaimable_slots())

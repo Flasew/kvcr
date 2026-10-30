@@ -517,6 +517,7 @@ class _LocalDram:
         self._start_deliveries(op, blocks)
 
     def discard_fill(self, keys: Collection[BlockKey]) -> None:
+        state = self._pools._source_state
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         for key in dict.fromkeys(keys):
@@ -536,7 +537,9 @@ class _LocalDram:
                 residency.state is _LocalDramState.FILLING
                 and not residency.pending_deposits
             ):
-                residency.state = _LocalDramState.DISCARDING
+                with state.lock:
+                    state.ready.pop(key, None)
+                    residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:
                 residency.remote_cancelled = True
             for op_id in record.active_op_ids:
@@ -571,6 +574,7 @@ class _LocalDram:
             self._finish_deliver_if_ready(deliver_op)
 
     def poll_main(self, items: Collection[object]) -> list[object]:
+        self._pools._drain_source_completions()
         # Progress-side source claims defer framework callbacks to the caller.
         self._pools._update_capacity_pressure()
         unhandled: list[object] = []
@@ -614,6 +618,9 @@ class _LocalDram:
             copy.success,
             CacheTier.FW_G2,
             writer=copy.deposit_op,
+            dst_descriptors=(
+                copy.dst_descriptors if self._kvcr.framework_control is not None else ()
+            ),
         )
 
     def _apply_fill_result(
@@ -624,6 +631,7 @@ class _LocalDram:
         source: CacheTier,
         *,
         writer: _PendingResidencyOp | None = None,
+        dst_descriptors: tuple[_TransferRef, ...] = (),
     ) -> None:
         committed: list[BlockKey] = []
         failed: list[BlockKey] = []
@@ -632,7 +640,10 @@ class _LocalDram:
         affected_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         deliver_keys: dict[_OpId, list[BlockKey]] = {}
         now = self._kvcr._clock()
+        offset = 0
         for key, indices in zip(ordered_keys, local_indices):
+            start = offset
+            offset += len(indices)
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if record is None or residency is None:
@@ -667,6 +678,14 @@ class _LocalDram:
                 if len(pending) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
+                    refs = None
+                    if (
+                        dst_descriptors
+                        and len(indices) == len(residency.slots)
+                        and indices == tuple(range(len(indices)))
+                    ):
+                        refs = dst_descriptors[start:offset]
+                    self._pools._publish_source(key, residency, refs)
                     record.last_access = now
                     if not was_ready:
                         self._kvcr._on_ingest(
@@ -949,6 +968,7 @@ class _LocalDram:
             return
         self._resuming_capacity_waiters = True
         try:
+            self._pools._drain_source_completions()
             # One pass lets other waiters run while discarded fills retain slots.
             for _ in range(len(self._capacity_waiters)):
                 waiter = self._capacity_waiters[0]
