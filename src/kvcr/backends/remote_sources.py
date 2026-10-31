@@ -38,6 +38,7 @@ class _SourcePinOp(_Op):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
     key_layout: tuple[str, ...] = ()
+    keys_to_move: tuple[BlockKey, ...] = ()
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -98,6 +99,11 @@ class _RemoteSources:
                     self._kvcr._record_access(
                         self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
                     )
+                    if item.keys_to_move:
+                        # Invalidate before release scores these copies for eviction.
+                        self._kvcr._invalidation_handler.submit(
+                            item.moved_keys(), key_layout=item.key_layout
+                        )
                 self._kvcr._release_local_dram_sources(item.op_id)
             if pins is not None:
                 self._release_framework_pins(pins)
@@ -272,6 +278,9 @@ class _RemoteSources:
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
         )
+        if source_pin.keys_to_move:
+            source_write.keys_to_move = source_pin.keys_to_move
+            source_write.key_layout = source_pin.key_layout
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
         kvcr._progress.submit(source_write)
@@ -382,9 +391,16 @@ class _RemoteSources:
 
     def start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
+        # Decide admission once; retries retain the original request positions.
+        pending = kvcr._invalidation_handler._pending
+        if pending:
+            op.keys = op.keys.difference(pending)
         kvcr._add_block_dependencies(op, new_operation=True)
         self._source_pin_ops[op.op_id] = op
-        self._resume_source_pin(op.op_id, op)
+        if op.ordered_keys and not op.keys:
+            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+        else:
+            self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         if self._source_pin_ops.get(op_id) is not op:

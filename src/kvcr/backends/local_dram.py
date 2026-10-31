@@ -237,6 +237,7 @@ class _LocalDram:
             return
 
         deadline = self._kvcr._operation_deadline()
+        # Decide admission once; accepted deposits may resume during removal.
         op = _PendingResidencyOp(
             op_id=("deposit", op_handle),
             keys=keys,
@@ -245,9 +246,14 @@ class _LocalDram:
             sources=blocks,
             hints=hints,
             key_layout=key_layout,
+            results=self._kvcr._invalidation_handler.rejected_entries(keys),
         )
         self._pending_residency_ops[op.op_id] = op
-        self._kvcr._add_block_dependencies(op, new_operation=True)
+        self._kvcr._add_block_dependencies(
+            op,
+            new_operation=True,
+            keys=op.keys - op.results.keys() if op.results else None,
+        )
         self._start_deposits(op, blocks)
 
     def _start_deposits(
@@ -407,9 +413,14 @@ class _LocalDram:
             key_layout=key_layout,
             fill_sources=sources,
             hints=hints,
+            results=self._kvcr._invalidation_handler.rejected_entries(ordered_keys),
         )
         self._pending_residency_ops[op.op_id] = op
-        self._kvcr._add_block_dependencies(op, new_operation=True)
+        self._kvcr._add_block_dependencies(
+            op,
+            new_operation=True,
+            keys=op.keys - op.results.keys() if op.results else None,
+        )
         destinations = {}
         for key in ordered_keys:
             refs = self._prepare_fetch(op, key)
@@ -421,6 +432,8 @@ class _LocalDram:
     def _prepare_fetch(
         self, op: _PendingResidencyOp, key: BlockKey
     ) -> list[_TransferRef] | None:
+        if key in op.results:
+            return None
         layout = op.requested_layout
         record = self._kvcr._block_record(key)
         residency = record.local_dram
@@ -467,6 +480,20 @@ class _LocalDram:
                 op.claimed_keys.add(key)
             if source is None or residency.remote_indices is not None:
                 return None
+            if residency.pending_deposits and source is CacheTier.REMOTE_G2:
+                move = self._kvcr._move_handler._pending.get(op.op_id[1])
+                if (
+                    move is not None
+                    and key in move.keys
+                    and any(
+                        residency.writers[index]
+                        for index in indices
+                        if residency.slots[index][0] in residency.pending_labels
+                    )
+                ):
+                    # Wait for other pieces before allowing whole-key source removal.
+                    # Their fill completion resumes this waiter.
+                    return None
             # One remote fill owns these destinations until its native terminal.
             missing = [
                 index
@@ -511,9 +538,14 @@ class _LocalDram:
             keys=frozenset(blocks),
             deadline=deadline,
             destinations=blocks,
+            results=self._kvcr._invalidation_handler.rejected_entries(blocks),
         )
         self._pending_deliver_ops[op.op_id] = op
-        self._kvcr._add_block_dependencies(op, new_operation=True)
+        self._kvcr._add_block_dependencies(
+            op,
+            new_operation=True,
+            keys=op.keys - op.results.keys() if op.results else None,
+        )
         self._start_deliveries(op, blocks)
 
     def discard_fill(self, keys: Collection[BlockKey]) -> None:
@@ -780,6 +812,7 @@ class _LocalDram:
                 {key: refs},
                 residency_op.request_id,
                 residency_op.deadline,
+                owner_handle=cast(OpHandle, residency_op.op_id[1]),
             )
         return key in residency_op.results
 

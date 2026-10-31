@@ -99,8 +99,12 @@ class _DanglingOps:
     def finish_source(self, op: "_SourceWriteOp") -> None:
         status = self.source_writes.pop((op.route[0], op.op_handle), None)
         if status is not None and op.local_sources:
-            self._backend._kvcr._local_dram._pools.release_readers(
-                op.source_keys, op.local_sources, success=op.success
+            core = self._backend._kvcr
+            core._local_dram._pools.release_readers(
+                op.source_keys,
+                op.local_sources,
+                success=op.success,
+                moved_keys=op.moved_keys() if op.success and op.keys_to_move else (),
             )
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")
