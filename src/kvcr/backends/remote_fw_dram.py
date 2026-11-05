@@ -83,6 +83,7 @@ class _RequestHint:
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
     move: bool = False
+    allow_framework: bool = True
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ class _RemoteFWDram:
         request_id: str | None,
         *,
         move: bool = False,
+        allow_framework: bool = True,
         timed: bool = True,
     ) -> None:
         """Record advice; ``timed`` advice measures router lead time as hint_wait."""
@@ -208,6 +210,7 @@ class _RemoteFWDram:
                 else None,
                 trace=trace,
                 move=move,
+                allow_framework=allow_framework,
             )
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
@@ -268,6 +271,7 @@ class _RemoteFWDram:
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
             local_fill=local_fill,
+            allow_framework=hint.allow_framework,
             keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
@@ -954,6 +958,7 @@ class _RemoteFWDram:
             dst_descriptors=dst_descriptors,
             local_sources=(),
             _backend=self,
+            allow_framework=payload.allow_framework,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
@@ -989,6 +994,7 @@ class _RemoteFWDram:
                 ordered_keys=op.source_keys,
                 dst_descriptors=op.dst_descriptors,
                 key_layout=key_layout,
+                allow_framework=op.allow_framework,
                 route=op.route,
                 nvtx_state=op.nvtx_state,
                 move=move,
@@ -1037,11 +1043,12 @@ class _RemoteFWDram:
     ) -> bool | None:
         """Return None to retry contention, False when caller work is needed."""
         local = self._kvcr._local_dram
+        framework_pinning = self._framework_pinning and source_write.allow_framework
         # Until prepared, the unregistered write retains the original request.
         ordered_keys = source_write.source_keys
         dst_descriptors = source_write.dst_descriptors
         if local is None:
-            if self._framework_pinning:
+            if framework_pinning:
                 return False
             selected = ()
         else:
@@ -1049,7 +1056,7 @@ class _RemoteFWDram:
                 ordered_keys,
                 dst_descriptors,
                 key_layout,
-                allow_missing=not self._framework_pinning,
+                allow_missing=not framework_pinning,
             )
         if selected is None:
             return None

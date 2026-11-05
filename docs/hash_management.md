@@ -47,6 +47,14 @@ validates them before invoking the existing full-key transfer path. This metadat
 exchange adds a round trip before transfer. Resolution does not claim source
 memory; the transfer revalidates residency if it changes in the meantime.
 
+The optional hint field `allow_framework` defaults to `true` for both scopes.
+If the managed source disappears after resolution, the transfer may obtain the
+same full key from framework memory. Set `allow_framework: false` to require
+complete managed G2 at transfer time: missing or incomplete keys fail without
+requesting or reusing framework pins. Request-scoped advice applies the same
+policy to subsequent fetch/deliver transfers. This policy does not reserve memory
+during resolution or enable resolution of framework-only keys.
+
 The destination stores records under the source's complete keys. A mapping alone
 is not a readable copy; successful transfer makes data available for framework
 reads using the same full key. Independent operations release their temporary

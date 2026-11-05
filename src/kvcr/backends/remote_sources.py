@@ -41,6 +41,7 @@ class _SourcePinOp(_Op):
     move: bool = False
     # Keys this move marked pending; reopened if they are not written.
     moving: tuple[BlockKey, ...] = ()
+    allow_framework: bool = True
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -171,7 +172,8 @@ class _RemoteSources:
         framework_sources = {
             key: record.fw_mem.descriptors
             for key in source_pin.keys
-            if key not in local_sources
+            if source_pin.allow_framework
+            and key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
@@ -182,6 +184,10 @@ class _RemoteSources:
             if key not in source_pin.keys:
                 continue
             residency = local_sources.get(key)
+            if not source_pin.allow_framework and (
+                residency is None or residency.pending_labels
+            ):
+                continue
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
@@ -444,6 +450,10 @@ class _RemoteSources:
             self._submit_prepared_source_write(
                 op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
             )
+            return
+
+        if not op.allow_framework:
+            self._submit_prepared_source_write(op_id, op)
             return
 
         local_sources = kvcr._claim_local_dram_sources(

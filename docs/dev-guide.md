@@ -204,7 +204,7 @@ uv run pytest -q
 
 `tests/e2e/run_hash_operations.py` exercises independent fetch/move hints with two KVCR processes, real NIXL transfers, and ZMQ peer control. It checks unrelated carrier requests, source-removal safety, and hash collisions at the KVCR boundary. Hints pass through JSON decoding before `submit_hint`. The suite needs neither vLLM nor Dynamo and does not run an inference engine or router.
 
-The native scenarios verify bytes in every named piece, inventory changes, and claim/advice/operation cleanup. They cover copy and move, retained sources and existing readers, cached destinations, mixed successful/missing/ambiguous hashes, duplicate hashes, collision recovery, and multiple actions sharing a carrier. Controlled source-disappearance races pause the destination's continuation after its real resolution reply. Removing or replacing the source then tests admission against the resolved full key. Ordinary framework fallback after source removal is checked using registered CPU buffers and a small framework callback fixture.
+The native scenarios verify bytes in every named piece, inventory changes, and claim/advice/operation cleanup. They cover copy and move, retained sources and existing readers, cached destinations, mixed successful/missing/ambiguous hashes, duplicate hashes, collision recovery, and multiple actions sharing a carrier. Controlled source-disappearance and hash-reuse races pause the destination's continuation after its real resolution reply. Removing or replacing the source then tests admission against the resolved full key. Framework fallback is checked with the default permission, explicit permission, and explicit denial, using registered CPU buffers and a small framework callback fixture.
 
 ```bash
 PYTHONPATH=src UCX_TLS=tcp,sm,self,cuda_copy \
@@ -220,6 +220,7 @@ The unit tests complement native coverage with deterministic failure injection:
 | --- | --- |
 | `tests/unit/test_hash_resolution.py` | Reply validation, endpoint identity, duplicates, timeouts, late replies, and lookup without the owner lock |
 | `tests/unit/test_cache_management.py` | All copy/move overlap combinations, partial destinations, per-action results, real fetch setup errors, and late move notifications |
+| `tests/unit/test_framework_access.py` | Filling sources, capacity waits, metadata retries, and exact-key identity after inventory changes |
 
 The race tests use continuation gates, explicit notifications, or fake clocks to establish ordering; elapsed sleeps do not decide which operation wins. A move can still report failure after successful source removal when the destination misses its final notification deadline; the tests preserve that existing contract.
 

@@ -130,6 +130,7 @@ class _IndependentHintHandler:
                 frozenset(hashes_by_key.values()),
                 advice,
                 move=hint.move,
+                allow_framework=hint.allow_framework,
                 timed=False,
             )
             try:

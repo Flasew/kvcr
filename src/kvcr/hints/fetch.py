@@ -35,6 +35,7 @@ class _KVFetchHint(msgspec.Struct, frozen=True):
     block_hashes: frozenset[int]
     move: bool = False
     scope: str = "request"
+    allow_framework: bool = True
 
 
 def _parse_kv_fetch(
@@ -71,12 +72,16 @@ def _parse_kv_fetch(
     scope = payload.get("scope", "request")
     if scope not in ("request", "independent"):
         raise ValueError("scope must be request or independent")
+    allow_framework = payload.get("allow_framework", True)
+    if not isinstance(allow_framework, bool):
+        raise ValueError("allow_framework must be a boolean")
     return _KVFetchHint(
         action_id,
         source,
         frozenset(hashes),
         move=mode == "move",
         scope=scope,
+        allow_framework=allow_framework,
     )
 
 
@@ -116,6 +121,7 @@ class _FetchHintHandler:
             hint.block_hashes,
             request_id,
             move=hint.move,
+            allow_framework=hint.allow_framework,
         )
         self._dispatcher.report(receipt)
 

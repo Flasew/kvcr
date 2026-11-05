@@ -271,6 +271,8 @@ The router may choose not to send a hint based on its internal cost model. Proac
 
 With `scope: "independent"`, or without a request ID, the hint starts an independent operation and may name blocks unrelated to its carrier request. The framework's key adapter owns reverse lookup through `decode_from_router`; the vLLM adapter maintains its mappings from inventory events. The destination asks the source for only the requested mappings, validates the returned keys and layouts, and uses the existing full-key transfer path. This adds a metadata round trip before transfer; ordinary full-key lookup remains unchanged. Ambiguous source hashes are rejected, as is a hint naming this node as its own source. See [hash-addressed operations](hash_management.md) for the contract and supported sources.
 
+In either scope, `allow_framework` defaults to `true`, permitting exact-key framework fallback. Set it to `false` to require complete KVCR-managed G2 at the source when transferring. Resolution does not reserve source memory.
+
 Each hint is handled independently. `discard_hint` removes the request's advice without cancelling independent operations. Source-less hints and `no_retain` are not supported. `deliver` remains a copy into framework-owned buffers, including when the request carries move advice.
 
 ### Move and source invalidation

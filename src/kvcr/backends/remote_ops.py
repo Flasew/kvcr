@@ -38,6 +38,8 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
     move: bool = False
+    # Whether the source may acquire or reuse framework-owned memory.
+    allow_framework: bool = True
 
 
 class _ResolvedHash(msgspec.Struct, frozen=True):
@@ -222,6 +224,7 @@ class _TargetPullOp(_RemoteOp):
     request_id: str | None = None
     key_layout: tuple[str, ...] = ()
     move: bool = False
+    allow_framework: bool = True
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -292,6 +295,7 @@ class _TargetPullOp(_RemoteOp):
                     dst_descriptors=self.dst_descriptors,
                     key_layout=self.key_layout if self.local_fill else (),
                     move=self.move,
+                    allow_framework=self.allow_framework,
                 ),
             )
             if not sent:
@@ -479,6 +483,8 @@ class _SourceWriteOp(_RemoteOp):
     source_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
+    # Preserve source policy while progress retries or queues caller preparation.
+    allow_framework: bool = True
     src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     transfer_id: int | None = None
     success: bool = False

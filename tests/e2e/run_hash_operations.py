@@ -422,6 +422,7 @@ class Workers:
         scope="independent",
         carrier_key=None,
         discard=False,
+        allow_framework=None,
     ):
         self.sequence += 1
         action_id = f"action-{self.sequence}"
@@ -431,6 +432,8 @@ class Workers:
             "scope": scope,
             "source_control_endpoint": self.info[1 - rank]["endpoint"],
         }
+        if allow_framework is not None:
+            payload["allow_framework"] = allow_framework
         carrier_result = self.call(
             rank,
             "hint",
@@ -512,7 +515,7 @@ class Workers:
             raise
 
 
-def unrelated_transfer(args, mode, *, protected=False):
+def unrelated_transfer(args, mode, *, protected=False, allow_framework=None):
     key, carrier = key_for(mode), key_for("unrelated-request")
     with Workers(args) as workers:
         retained = workers.operation(0, "deposit", key, no_evict=protected)
@@ -524,6 +527,7 @@ def unrelated_transfer(args, mode, *, protected=False):
             (Adapter().encode_to_router(key),),
             carrier_key=carrier,
             discard=True,
+            allow_framework=allow_framework,
         )
         assert advice == [("FETCHABLE", "REMOTE_G2")]
         entries = workers.terminal(1, action)
@@ -570,7 +574,7 @@ def unrelated_copy(args):
 
 
 def unrelated_move(args):
-    unrelated_transfer(args, "move")
+    unrelated_transfer(args, "move", allow_framework=False)
 
 
 def protected_move(args):
@@ -643,7 +647,9 @@ def mixed_hash_batch(args, mode):
     with Workers(args) as workers:
         for key in (live, collision, other):
             workers.operation(0, "deposit", key, no_evict=False)
-        action, _ = workers.hint(1, mode, (live_hash, missing, ambiguous, live_hash))
+        action, _ = workers.hint(
+            1, mode, (live_hash, missing, ambiguous, live_hash), allow_framework=False
+        )
         entries = workers.terminal(1, action, "FAILED")
         assert entries == {
             live_hash: {"success": True, "keys": (live,), "reason": None},
@@ -668,7 +674,9 @@ def cached_destination(args, mode):
         for rank in range(2):
             workers.operation(rank, "deposit", key, no_evict=False)
         reader = workers.operation(1, "fetch", key)
-        action, _ = workers.hint(1, mode, (Adapter().encode_to_router(key),))
+        action, _ = workers.hint(
+            1, mode, (Adapter().encode_to_router(key),), allow_framework=False
+        )
         assert workers.terminal(1, action)[Adapter().encode_to_router(key)]["success"]
         assert workers.call(1, "verify_reader", key=key, handle=reader)
         assert workers.call(1, "release", handles=[reader]) == [(reader, True)]
@@ -680,14 +688,17 @@ def cached_destination(args, mode):
         )
 
 
-def source_disappears(args, mode):
-    """Revalidate a resolved key after G2 removal using ordinary framework fallback."""
+def source_disappears(args, mode, allow_framework):
+    """Remove G2 after a real reply; only permitted fallback can copy its bytes."""
     key = key_for("disappearing")
     block_hash = Adapter().encode_to_router(key)
+    allowed = allow_framework is not False
     with Workers(args) as workers:
         workers.operation(0, "deposit", key, no_evict=False)
         workers.call(1, "pause_resolutions")
-        action, _ = workers.hint(1, mode, (block_hash,), discard=True)
+        action, _ = workers.hint(
+            1, mode, (block_hash,), allow_framework=allow_framework, discard=True
+        )
         rows = workers.until(lambda: workers.call(1, "resolutions"))
         assert rows == [[(block_hash, key, None)]]
         workers.call(0, "invalidate", key=key)
@@ -697,13 +708,47 @@ def source_disappears(args, mode):
         }
         workers.call(0, "framework_key", key=key)
         assert workers.call(1, "resume_resolutions") == 1
-        assert workers.terminal(1, action)[block_hash] == {
-            "success": True,
+        entries = workers.terminal(1, action, "COMPLETED" if allowed else "FAILED")
+        assert entries[block_hash] == {
+            "success": allowed,
             "keys": (key,),
-            "reason": None,
+            "reason": None if allowed else "operation_failed",
         }
-        assert workers.call(0, "pin_requests") == [(key,)]
-        workers.delivered(1, key)
+        assert workers.call(0, "pin_requests") == ([(key,)] if allowed else [])
+        if allowed:
+            workers.delivered(1, key)
+        else:
+            assert workers.call(1, "query", key=key) == [("MISS", None)]
+        for rank in range(2):
+            workers.idle(rank)
+
+
+def hash_rebound_after_resolution(args, mode):
+    """A reused hash must never redirect a resolved transfer to a different key."""
+    old, replacement = key_for("rebound"), key_for("rebound", group=1)
+    block_hash = Adapter().encode_to_router(old)
+    with Workers(args) as workers:
+        workers.operation(0, "deposit", old, no_evict=False)
+        workers.call(1, "pause_resolutions")
+        action, _ = workers.hint(1, mode, (block_hash,), allow_framework=False)
+        assert workers.until(lambda: workers.call(1, "resolutions")) == [
+            [(block_hash, old, None)]
+        ]
+        workers.call(0, "invalidate", key=old)
+        workers.until(lambda: not workers.call(0, "resident", key=old))
+        workers.operation(0, "deposit", replacement, no_evict=False)
+        assert workers.call(0, "lookup_hash", block_hash=block_hash) == {
+            "key": replacement
+        }
+        workers.call(1, "resume_resolutions")
+        assert workers.terminal(1, action, "FAILED")[block_hash] == {
+            "success": False,
+            "keys": (old,),
+            "reason": "operation_failed",
+        }
+        workers.delivered(0, replacement)
+        for key in (old, replacement):
+            assert workers.call(1, "query", key=key) == [("MISS", None)]
         for rank in range(2):
             workers.idle(rank)
 
@@ -722,7 +767,7 @@ def collision_recovers(args):
         workers.call(0, "invalidate", key=other)
         workers.until(lambda: not workers.call(0, "resident", key=other))
         assert workers.call(0, "lookup_hash", block_hash=block_hash) == {"key": key}
-        action, _ = workers.hint(1, "move", (block_hash,))
+        action, _ = workers.hint(1, "move", (block_hash,), allow_framework=False)
         assert workers.terminal(1, action)[block_hash]["keys"] == (key,)
         workers.delivered(1, key)
         for rank in range(2):
@@ -757,6 +802,7 @@ def mixed_action_envelope(args):
                     "source_control_endpoint": workers.info[0]["endpoint"],
                     "scope": scope,
                     "mode": mode,
+                    "allow_framework": False,
                 },
             )
 
@@ -828,11 +874,17 @@ def scenarios():
         for run in (
             mixed_hash_batch,
             cached_destination,
+            hash_rebound_after_resolution,
         ):
             cases[f"{run.__name__}_{mode}"] = partial(run, mode=mode)
-        cases[f"source_disappears_{mode}_framework_default"] = partial(
-            source_disappears, mode=mode
-        )
+        for name, permission in (
+            ("default", None),
+            ("allowed", True),
+            ("denied", False),
+        ):
+            cases[f"source_disappears_{mode}_framework_{name}"] = partial(
+                source_disappears, mode=mode, allow_framework=permission
+            )
     return cases
 
 

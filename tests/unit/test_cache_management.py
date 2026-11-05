@@ -55,6 +55,7 @@ def _submit(
     request_id=None,
     source="tcp://source:1",
     scope="independent",
+    allow_framework=None,
 ):
     _reports(worker)
     payload = {
@@ -63,6 +64,8 @@ def _submit(
         "scope": scope,
         "mode": mode,
     }
+    if allow_framework is not None:
+        payload["allow_framework"] = allow_framework
     worker.submit_hint(
         _HintEnvelope(
             "0.1",
