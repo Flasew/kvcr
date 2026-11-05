@@ -673,6 +673,40 @@ class _ConstantHashAdapter:
         return 123
 
 
+class _InventoryKeyAdapter(_ConstantHashAdapter):
+    """Test framework: publish immutable lookup snapshots from inventory only."""
+
+    def __init__(self):
+        self.inventory = {}
+        self.keys_by_hash = {}
+
+    def update_inventory(self, event):
+        for key in event.keys:
+            tiers = self.inventory.setdefault(key, set())
+            if event.removed:
+                tiers.discard(event.tier)
+                if not tiers:
+                    del self.inventory[key]
+            else:
+                tiers.add(event.tier)
+            block_hash = self.encode_to_router(key)
+            keys = tuple(
+                known
+                for known in self.inventory
+                if self.encode_to_router(known) == block_hash
+            )
+            if keys:
+                self.keys_by_hash[block_hash] = keys
+            else:
+                self.keys_by_hash.pop(block_hash, None)
+
+    def decode_from_router(self, router_key):
+        keys = self.keys_by_hash[router_key]
+        if len(keys) != 1:
+            raise ValueError("ambiguous router hash")
+        return keys[0]
+
+
 def _recovered_record(
     *, g2: list[tuple[str, int]] | None = None, g3: int | None = None, g3_pool: str = ""
 ) -> _BlockRecord:

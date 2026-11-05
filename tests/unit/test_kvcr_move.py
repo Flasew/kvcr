@@ -14,12 +14,12 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakePrimaryPinning,
     _buffer_region,
-    _ConstantHashAdapter,
     _decode_control_message,
     _has_outstanding_operations,
     _HintAction,
     _HintEnvelope,
     _invalidate,
+    _InventoryKeyAdapter,
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
@@ -62,6 +62,18 @@ class _IndividualG3WriteAgent(_FakeG3Agent):
         return self.states.get(handle, self.state)
 
 
+def _publish_to(adapter, events):
+    """Inventory sink: log every event and feed adapters that keep a reverse map."""
+    update = getattr(adapter, "update_inventory", None)
+
+    def publish(event):
+        events.append(event)
+        if update is not None:
+            update(event)
+
+    return publish
+
+
 class _Pair:
     """Real buffers with manually forwarded control messages and completions."""
 
@@ -76,6 +88,7 @@ class _Pair:
         block_size=16,
         source_g3=None,
         source_policy=None,
+        key_adapter_type=_InventoryKeyAdapter,
     ):
         self.labels = labels
         target_labels = labels if target_labels is None else target_labels
@@ -123,6 +136,8 @@ class _Pair:
                 ]
             )
 
+        source_adapter = key_adapter_type()
+        target_adapter = key_adapter_type()
         self.source = _new_kvcr(
             self.source_agent,
             self.source_pinning,
@@ -136,8 +151,8 @@ class _Pair:
                 for label, memory in self.source_primary.items()
             ],
             policy=source_policy or _KeepPolicy(),
-            key_adapter=_ConstantHashAdapter(),
-            inventory_sink=self.source_events.append,
+            key_adapter=source_adapter,
+            inventory_sink=_publish_to(source_adapter, self.source_events),
         )
         self.source._core._clock = lambda: self.source_now
         self.target = _new_kvcr(
@@ -153,11 +168,11 @@ class _Pair:
                 _buffer_region(memory, block_size, label)
                 for label, memory in self.target_primary.items()
             ],
-            key_adapter=_ConstantHashAdapter(),
+            key_adapter=target_adapter,
+            inventory_sink=_publish_to(target_adapter, self.target_events),
             remote_options=RemoteFWDramOptions(
                 eager_ctrl_connect=False, opportunistic_query=opportunistic_query
             ),
-            inventory_sink=self.target_events.append,
         )
         self.target._core._clock = lambda: 0.0
 

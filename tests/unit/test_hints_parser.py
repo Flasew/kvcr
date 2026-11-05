@@ -85,6 +85,26 @@ def test_fetch_hint_rejects_invalid_mode(mode):
     ]
 
 
+@pytest.mark.parametrize("allow_framework", [None, True, False])
+def test_fetch_hint_parses_framework_permission(allow_framework):
+    action = _fetch_hint("a", "tcp://source:1", (1,))
+    if allow_framework is not None:
+        action.payload["allow_framework"] = allow_framework
+    hints, rejected = parse_hints(_HintEnvelope("0.1", "m", [action]), _types())
+    assert not rejected
+    assert hints[0].allow_framework is (allow_framework is not False)
+
+
+@pytest.mark.parametrize("allow_framework", [None, 0, 1, "true", "false", [], {}])
+def test_fetch_hint_rejects_invalid_framework_permission(allow_framework):
+    action = _fetch_hint("a", "tcp://source:1", (1,), allow_framework=allow_framework)
+    hints, rejected = parse_hints(_HintEnvelope("0.1", "m", [action]), _types())
+    assert not hints
+    assert [(r.status, r.reason) for r in rejected] == [
+        (HintStatus.REJECTED, "allow_framework must be a boolean")
+    ]
+
+
 def test_parse_hints_rejects_invalid_actions_and_payloads():
     hint = _HintEnvelope(
         "0.1",

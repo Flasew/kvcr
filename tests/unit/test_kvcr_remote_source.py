@@ -98,12 +98,15 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
         ([b"local"], [], "requested_labels"),
     ],
 )
-def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_caplog):
+@pytest.mark.parametrize("allow_framework", [False, True])
+def test_local_only_source_serves_available_keys(
+    keys, completed_indices, source_case, allow_framework, kvcr_caplog
+):
     kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram_pools")
-    pinning = SimpleNamespace(
-        request_pin=None,
-        poll_pin_results=None,
-        release_pin=None,
+    pinning = (
+        FakePrimaryPinning()
+        if not allow_framework
+        else SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None)
     )
     memory = ctypes.create_string_buffer(b"a" * 16, 16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
@@ -136,6 +139,7 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     request.update(
         keys=keys,
         dst_descriptors=[[_TransferRef("target", i)] for i in range(len(keys))],
+        allow_framework=allow_framework,
     )
     if source_case == "key_layout":
         request["key_layout"] = ["", ":other"]
@@ -155,6 +159,8 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     if completed_indices:
         assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    if not allow_framework:
+        assert pinning.searches == []
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
@@ -487,7 +493,8 @@ def test_local_source_waits_for_declared_pieces(
 @pytest.mark.parametrize(
     "outcome", ["write", "framework", "deadline", "cancel", "route", "shutdown"]
 )
-def test_local_source_retries_after_reader_contention(outcome):
+@pytest.mark.parametrize("allow_framework", [False, True])
+def test_local_source_retries_after_reader_contention(outcome, allow_framework):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
@@ -513,10 +520,14 @@ def test_local_source_retries_after_reader_contention(outcome):
         deposit = source.deposit({key: [descriptor]})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         agent.state = "PROC"
+        request = msgspec.msgpack.decode(
+            _start_write_message(12, requested_key, target_agent="target")
+        )
+        request["allow_framework"] = allow_framework
         with local._source_state.lock:
             control.incoming.extend(
                 [
-                    _start_write_message(12, requested_key, target_agent="target"),
+                    msgspec.msgpack.encode(request),
                     _write_probe_message(99),
                 ]
             )
@@ -551,15 +562,22 @@ def test_local_source_retries_after_reader_contention(outcome):
             _wait_until(lambda: len(agent.xfers) == 2)
             assert source._core._block_record_map[key].local_dram.source_readers == 1
             assert local.telemetry_state()["local_g2_evictable_slots"] == 0
-        elif outcome == "framework":
+        elif outcome == "framework" and allow_framework:
             assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
-        assert pinning.searches == (
-            [(requested_key,)] if outcome == "framework" else []
-        )
+        elif outcome == "framework":
+            _poll_until(source, lambda _: bool(agent.sent_notifs))
+            assert _decode_notif(agent.sent_notifs[0][1]) == {
+                "type": "write_done",
+                "op_handle": 12,
+                "success": True,
+                "completed_indices": [],
+            }
+        pinned = outcome == "framework" and allow_framework
+        assert pinning.searches == ([(requested_key,)] if pinned else [])
         agent.state = "DONE"
         _poll_until(source, lambda _: not _has_outstanding_operations(source))
-        assert len(agent.xfers) == (2 if outcome in ("write", "framework") else 1)
-        assert pinning.unpins == (["pin"] if outcome == "framework" else [])
+        assert len(agent.xfers) == (2 if outcome == "write" or pinned else 1)
+        assert pinning.unpins == (["pin"] if pinned else [])
         assert source._core._outstanding_operations == 0
         assert source._core._block_record_map[key].local_dram.claim_count == 0
     finally:
@@ -768,6 +786,8 @@ def test_kvcr_close_cleans_pending_pin_operations():
         ("remaining_timeout_ms", float("nan")),
         ("remaining_timeout_ms", float("inf")),
         ("key_layout", "yes"),
+        ("allow_framework", "true"),
+        ("allow_framework", 1),
         ("keys", [b"k0", b"k0"]),
         ("keys", []),
         ("keys", ["k0"]),
@@ -1546,10 +1566,13 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     [("abc", (0, 1, 2)), ("ca", (2, 0)), ("x", ())],
     ids=["whole", "partial", "unknown"],
 )
+@pytest.mark.parametrize("allow_framework", [False, True])
 def test_a_resumed_write_holds_a_pin_another_operation_acquired(
-    parts, selected
+    parts, selected, allow_framework
 ) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
+    if not allow_framework:
+        selected = ()
     backend = object.__new__(_RemoteFWDram)
     kvcr = object.__new__(_KVCRCore)
     kvcr._block_record_map = {}
@@ -1587,6 +1610,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         op_id=("source", 1),
         keys=frozenset((key,)),
         framework_pins={stale},
+        allow_framework=allow_framework,
     )
     backend._sources._source_pin_ops[("source", 1)] = waiting
 

@@ -43,13 +43,18 @@ from ..types import (
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
+from .local_dram_pools import _LocalDramState
 from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
     _decode_notif,
+    _HashResolutionOp,
     _Invalidate,
     _NvtxState,
     _PeerMessage,
+    _ResolvedHash,
+    _ResolveHashesReply,
+    _ResolveHashesRequest,
     _SourceWriteOp,
     _SourceWriteState,
     _StartWrite,
@@ -78,6 +83,7 @@ class _RequestHint:
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
     move: bool = False
+    allow_framework: bool = True
 
 
 @dataclass(frozen=True)
@@ -167,7 +173,10 @@ class _RemoteFWDram:
         request_id: str | None,
         *,
         move: bool = False,
+        allow_framework: bool = True,
+        timed: bool = True,
     ) -> None:
+        """Record advice; ``timed`` advice measures router lead time as hint_wait."""
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
@@ -196,9 +205,12 @@ class _RemoteFWDram:
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
                     else kvcr._timer()
-                ),
+                )
+                if timed
+                else None,
                 trace=trace,
                 move=move,
+                allow_framework=allow_framework,
             )
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
@@ -259,6 +271,7 @@ class _RemoteFWDram:
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
             local_fill=local_fill,
+            allow_framework=hint.allow_framework,
             keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
@@ -396,6 +409,8 @@ class _RemoteFWDram:
                 self._kvcr._invalidation_handler.submit(
                     item.keys, key_layout=item.key_layout
                 )
+            elif isinstance(item, _HashResolutionOp):
+                self._kvcr._independent_hint_handler._resolved.append(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -597,12 +612,92 @@ class _RemoteFWDram:
                 self._dangling_ops.handle_probe(progress, payload)
             elif isinstance(payload, _WriteProbeAck):
                 self._dangling_ops.handle_probe_ack(progress, payload)
+            elif isinstance(payload, _ResolveHashesRequest):
+                self._handle_resolve_hashes(progress, payload)
+            elif isinstance(payload, _ResolveHashesReply):
+                op = progress._in_flight_ops.get(("resolve_hashes", payload.op_handle))
+                if isinstance(op, _HashResolutionOp):
+                    op.receive(payload)
             handled = True
             if handled_at is not None:
                 self._record_progress_duration(
                     f"control_{payload.__struct_config__.tag}", handled_at, "handled"
                 )
         return handled
+
+    def _handle_resolve_hashes(
+        self, progress: _KVCRProgress, request: _ResolveHashesRequest
+    ) -> None:
+        if not request.sender_control_endpoint:
+            return
+        error, rows = None, ()
+        if (
+            not math.isfinite(request.remaining_timeout_ms)
+            or request.remaining_timeout_ms <= 0
+            or not request.hashes
+            or len(set(request.hashes)) != len(request.hashes)
+            or any(not 0 <= value < 1 << 64 for value in request.hashes)
+        ):
+            error = "invalid_request"
+        elif request.sender_incarnation == self._dangling_ops.incarnation:
+            # The requester is this process: a destination cannot resolve
+            # hashes against its own cache, so refuse before any lookup.
+            error = "self_source"
+        elif progress._stop_requested:
+            error = "closed"
+        else:
+            try:
+                rows = self._resolve_hashes(request.hashes)
+            except Exception:
+                logger.warning("Hash metadata lookup failed", exc_info=True)
+                error = "resolution_failed"
+        self._send_control(
+            progress,
+            request.sender_control_endpoint,
+            _ResolveHashesReply(
+                op_handle=request.op_handle,
+                results=rows,
+                error=error,
+                # Preserve the address the requester used, including aliases.
+                sender_control_endpoint=request.source_control_endpoint,
+            ),
+        )
+
+    def _resolve_hashes(self, hashes: Collection[int]) -> tuple[_ResolvedHash, ...]:
+        """Resolve advisory identities; the later transfer claims source memory."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return tuple(
+                _ResolvedHash(value, reason="key_adapter_unavailable")
+                for value in hashes
+            )
+        core = self._kvcr
+        rows = []
+        for block_hash in hashes:
+            try:
+                key = adapter.decode_from_router(block_hash)
+            except KeyError:
+                rows.append(_ResolvedHash(block_hash, reason="not_found"))
+                continue
+            except ValueError:
+                rows.append(_ResolvedHash(block_hash, reason="ambiguous_hash"))
+                continue
+            record = core._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            layout = local.key_layout if local is not None else None
+            if (
+                local is None
+                or record.pending_invalidation
+                or local.state is _LocalDramState.DISCARDING
+                or not layout
+            ):
+                rows.append(_ResolvedHash(block_hash, reason="source_not_transferable"))
+                continue
+            sizes = tuple(
+                core._block_sizes[label.partition(":")[0]] for label in layout
+            )
+            rows.append(_ResolvedHash(block_hash, key, layout, sizes))
+        return tuple(rows)
 
     def _send_control(
         self,
@@ -623,7 +718,16 @@ class _RemoteFWDram:
         if not isinstance(payload, _TargetMetadataAck):
             payload.source_control_endpoint = endpoint
         includes_metadata = (
-            not isinstance(payload, (_TargetMetadataAck, _WriteRefused, _Invalidate))
+            not isinstance(
+                payload,
+                (
+                    _TargetMetadataAck,
+                    _WriteRefused,
+                    _Invalidate,
+                    _ResolveHashesRequest,
+                    _ResolveHashesReply,
+                ),
+            )
             and endpoint not in self._metadata_acked_sources
             and (
                 isinstance(payload, (_TargetMetadata, _StartWrite))
@@ -854,6 +958,7 @@ class _RemoteFWDram:
             dst_descriptors=dst_descriptors,
             local_sources=(),
             _backend=self,
+            allow_framework=payload.allow_framework,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
@@ -889,6 +994,7 @@ class _RemoteFWDram:
                 ordered_keys=op.source_keys,
                 dst_descriptors=op.dst_descriptors,
                 key_layout=key_layout,
+                allow_framework=op.allow_framework,
                 route=op.route,
                 nvtx_state=op.nvtx_state,
                 move=move,
@@ -937,11 +1043,12 @@ class _RemoteFWDram:
     ) -> bool | None:
         """Return None to retry contention, False when caller work is needed."""
         local = self._kvcr._local_dram
+        framework_pinning = self._framework_pinning and source_write.allow_framework
         # Until prepared, the unregistered write retains the original request.
         ordered_keys = source_write.source_keys
         dst_descriptors = source_write.dst_descriptors
         if local is None:
-            if self._framework_pinning:
+            if framework_pinning:
                 return False
             selected = ()
         else:
@@ -949,7 +1056,7 @@ class _RemoteFWDram:
                 ordered_keys,
                 dst_descriptors,
                 key_layout,
-                allow_missing=not self._framework_pinning,
+                allow_missing=not framework_pinning,
             )
         if selected is None:
             return None

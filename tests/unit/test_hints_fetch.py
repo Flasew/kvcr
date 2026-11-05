@@ -163,10 +163,16 @@ def test_all_invalid_envelope_does_not_raise_from_submit_hint(monkeypatch):
     assert [r.status for r in results] == [HintStatus.REJECTED]
 
 
-def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
+def test_independent_fetch_hint_reports_failure_without_dram(
+    monkeypatch,
+):
     kvcr, results = _fetch_kvcr(monkeypatch)
     kvcr.submit_hint(_router_hint("tcp://a:1", (1,)))
-    assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, None)]
+    assert [(r.status, r.request_id) for r in results] == [
+        (HintStatus.ACCEPTED, None),
+        (HintStatus.FAILED, None),
+    ]
+    assert results[-1].entries[1].reason == "destination_has_no_managed_dram"
     assert not kvcr._core._remote_fw_dram._request_hints
 
 
