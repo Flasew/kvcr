@@ -160,6 +160,8 @@ For `on_resilience_event` and optional framework-memory quarantine, see the [res
 
 See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
+For `kv.prefetch` and `kv.move`, configure the key adapter's reverse lookup and keep polling both peers. See [hash-addressed operations](hash_management.md) for the payload and managed-G2 contract. Hash RPC tests live in the [remote-source](../tests/unit/test_kvcr_remote_source.py) and [remote-target](../tests/unit/test_kvcr_remote_target.py) suites; the latter also covers full-key moves. The [hint tests](../tests/unit/test_hints_fetch.py) cover independent execution and cleanup.
+
 ### Development loop
 
 Run a focused test while iterating, then the complete standalone validation before finishing. If an adapter or router contract changed, run the optional integration validation separately.

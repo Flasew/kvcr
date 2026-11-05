@@ -261,6 +261,20 @@ A `kv.fetch` hint identifies a source control endpoint and advertised block hash
 
 Failed or conflicting advice does not prevent local cache hits. `discard_hint` clears request advice without cancelling already-started operations. A `kv.fetch` without a request ID does not execute an independent operation. Source-less hints and `no_retain` are unsupported.
 
+We plan to add a request-scoped `kv.migrate` hint to move KV cache for cold starts.
+
+### Independent hints
+
+`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Each hint names a source and block hashes and runs independently of its carrier request's keys and lifetime. Request advice and independent actions can share an envelope, and independent actions also work without a request ID.
+
+The destination first resolves the hashes into full keys and layouts, validates the reply, then transfers complete blocks from the source's KVCR-managed DRAM (G2). See [hash-addressed operations](hash_management.md) for detailed contracts.
+
+### Move and source invalidation
+
+For moves, the source withdraws eligible blocks from new access before transferring them. After a successful transfer, it removes their G2 copies once existing readers finish. A failed transfer keeps the source copy and reopens access. If the destination already has complete copies, it sends invalidation without copying them again.
+
+Removal is best effort and honors `no_evict`; framework and G3 copies remain. Destination completion reports data readiness, while source cleanup may finish later. Source removal does not wait for destination acknowledgement.
+
 ### Peer control and liveness
 
 The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints belong to request advice or an independent operation rather than global block state, so this coordination adds no KVCR-side peer inventory.
@@ -309,7 +323,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims prevent eviction while held. `no_retain` is not currently supported.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims prevent eviction while held. Move uses the source invalidation rules above rather than a policy eviction decision. `no_retain` is not currently supported.
 
 The policy methods are invoked as follows:
 

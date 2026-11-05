@@ -49,6 +49,7 @@ from ..types import (
     ReleaseHandle,
     ReleaseResult,
 )
+from .independent_hint_handler import _IndependentHintHandler
 from .invalidation import _InvalidationHandler
 from .policy_runtime import _PolicyInvoker
 from .progress import (
@@ -332,6 +333,7 @@ class _KVCRCore:
             else None
         )
         # Built after the backends so hint handlers can bind to them.
+        self._independent_hint_handler = _IndependentHintHandler(self)
         self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram._pools.memory_regions}
@@ -826,8 +828,11 @@ class _KVCRCore:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
                 self._drain_invalidation()
+        self._independent_hint_handler.poll_resolved()
         completed = self._completion_queue
         self._completion_queue = []
+        if self._independent_hint_handler._pending_operations:
+            completed = self._independent_hint_handler.finish(completed)
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)
@@ -929,6 +934,7 @@ class _KVCRCore:
     def _close_hint_handlers(self) -> None:
         with self._state_lock:
             self._hints_dispatcher.close()
+            self._independent_hint_handler.close()
 
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
