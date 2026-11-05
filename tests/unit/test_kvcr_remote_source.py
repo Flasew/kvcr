@@ -18,6 +18,7 @@ from _kvcr_test_utils import (
     FakeTelemetryStats,
     PendingPrimaryPinning,
     _buffer_region,
+    _ConstantHashAdapter,
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
@@ -33,13 +34,95 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
-from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
+from kvcr.backends.remote_ops import (
+    _CONTROL_DECODER,
+    _ResolveHashesRequest,
+    _TargetMetadata,
+)
 from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.runtime.core import _BlockRecord, _KVCRCore
 from kvcr.runtime.progress import _STOP, _TransferRef
 from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
+
+
+@pytest.mark.parametrize(
+    "case", ["ready", "ambiguous", "stale", "adapter_error", "self", "expired"]
+)
+def test_hash_resolution_replies_without_owner_poll_or_state_lock(case):
+    """Source resolution returns advisory metadata without pinning or copying."""
+    key = BlockKey(b"full-key-with-group")
+    adapter = _ConstantHashAdapter()
+    adapter.decode_from_router = Mock(
+        side_effect=[
+            {
+                "ambiguous": ValueError("collision"),
+                "adapter_error": RuntimeError("bug"),
+            }.get(case, key),
+            KeyError(999),
+        ]
+    )
+    agent, pinning = FakeNixlAgent(), FakePrimaryPinning()
+    agent.state = "DONE"
+    control = FakeBytesControl("tcp://source:1")
+    primary, local = ctypes.create_string_buffer(16), ctypes.create_string_buffer(32)
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        key_adapter=adapter,
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 32)]),
+    )
+    if case != "stale":
+        deposited = source.deposit({key: [_mem_descriptor(end_point_name="source")]})
+        assert dict(_poll_until(source, bool))[deposited][key].success
+    backend = source._core._remote_fw_dram
+    before = len(agent.xfers)
+    request = _ResolveHashesRequest(
+        op_handle=7,
+        hashes=(123, 999),
+        remaining_timeout_ms=0 if case == "expired" else 1000,
+        sender_control_endpoint="tcp://target:1",
+        sender_incarnation=(
+            backend._dangling_ops.incarnation if case == "self" else "peer-generation"
+        ),
+    )
+    with source._core._state_lock:
+        control.incoming.append(msgspec.msgpack.encode(request))
+        _wait_until(lambda: bool(control.sent))
+        response = _decode_control_message(control.sent[-1][1])
+    assert response["type"] == "hashes_resolved" and response["op_handle"] == 7
+    assert len(agent.xfers) == before and not pinning.searches
+    assert "target_regions" not in response and "target_agent_metadata" not in response
+    if case in ("self", "expired"):
+        assert response["error"] == (
+            "self_source" if case == "self" else "invalid_request"
+        )
+        adapter.decode_from_router.assert_not_called()
+        return
+    first, unknown = response["results"]
+    assert unknown["block_hash"] == 999 and unknown["reason"] == "not_found"
+    if case == "ready":
+        assert first == {
+            "block_hash": 123,
+            "key": key,
+            "layout": [""],
+            "sizes": [16],
+            "reason": None,
+        }
+    else:
+        assert first["key"] is None
+        assert (
+            first["reason"]
+            == {
+                "ambiguous": "ambiguous_hash",
+                "stale": "source_not_transferable",
+                "adapter_error": "resolution_failed",
+            }[case]
+        )
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])

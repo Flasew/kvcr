@@ -34,6 +34,11 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends.remote_ops import (
+    _HashResolutionOp,
+    _ResolvedHash,
+    _ResolveHashesReply,
+)
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -48,6 +53,79 @@ from kvcr.types import (
 
 def _make_block_key(block_hash: bytes, group_idx: int) -> BlockKey:
     return BlockKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ready",
+        "wrong_peer",
+        "wrong_hash",
+        "duplicate",
+        "source_error",
+        "timeout",
+        "missing_reason",
+        "invalid_sizes",
+    ],
+)
+def test_hash_resolution_client_validates_reply_and_completes_on_owner(case):
+    """Resolution is usable without independent hints; callbacks run exactly once."""
+    agent, control = FakeNixlAgent(), FakeBytesControl("tcp://target:1")
+    target = _new_kvcr(agent, FakePrimaryPinning(), control)
+    core = target._core
+    core._clock = lambda: 0.0
+    completed = []
+    operation = _HashResolutionOp(
+        op_id=("resolve_hashes", 7),
+        keys=frozenset(),
+        endpoint="tcp://source:1",
+        hashes=(123,),
+        _backend=core._remote_fw_dram,
+        on_complete=completed.append,
+    )
+    core._progress.submit(operation)
+    _wait_until(lambda: operation.sent)
+    request = _decode_control_message(control.sent[-1][1])
+    assert request["type"] == "resolve_hashes" and request["hashes"] == [123]
+    assert "target_regions" not in request and "target_agent_metadata" not in request
+    row = _ResolvedHash(999 if case == "wrong_hash" else 123, b"full-key", ("",), (16,))
+    if case == "missing_reason":
+        row = _ResolvedHash(123)
+    elif case == "invalid_sizes":
+        row = _ResolvedHash(123, b"full-key", ("",), ())
+    reply = _ResolveHashesReply(
+        op_handle=7,
+        results=()
+        if case == "source_error"
+        else ((row, row) if case == "duplicate" else (row,)),
+        error="resolution_failed" if case == "source_error" else None,
+        sender_control_endpoint=operation.endpoint,
+    )
+    if case == "wrong_peer":
+        wrong = msgspec.structs.replace(reply, sender_control_endpoint="tcp://other:1")
+        operation.receive(wrong)
+        assert operation.response is None and operation.failure is None
+    if case == "timeout":
+        core._clock = lambda: operation.deadline + 1
+    control.incoming.append(msgspec.msgpack.encode(reply))
+    _wait_until(lambda: operation.op_id not in core._progress._in_flight_ops)
+    assert not completed  # Progress completion alone cannot invoke the owner callback.
+    assert not _poll_until(target, lambda _: bool(completed))
+    assert completed == [operation]
+    assert operation.failure == {
+        "wrong_hash": "invalid_response",
+        "duplicate": "invalid_response",
+        "missing_reason": "invalid_response",
+        "invalid_sizes": "invalid_response",
+        "source_error": "resolution_failed",
+        "timeout": "timeout",
+    }.get(case)
+    if operation.failure is None:
+        assert operation.response == (row,)
+    control.incoming.append(msgspec.msgpack.encode(reply))
+    _wait_until(lambda: not control.incoming)
+    assert not target.poll_completed() and completed == [operation]
+    assert not agent.xfers
 
 
 class _CopyingWriteAgent(FakeNixlAgent):

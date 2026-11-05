@@ -3,7 +3,7 @@
 """Remote transfer operations and wire-format helpers."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -39,6 +39,30 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     source_incarnation: str | None = None
 
 
+class _ResolvedHash(msgspec.Struct, frozen=True):
+    block_hash: int
+    key: BlockKey | None = None
+    layout: tuple[str, ...] = ()
+    sizes: tuple[int, ...] = ()
+    reason: str | None = None
+
+
+class _ResolveHashesRequest(_PeerMessage, tag="resolve_hashes"):
+    """Wire request for full keys and layouts matching advertised hashes."""
+
+    op_handle: OpHandle
+    hashes: tuple[int, ...]
+    remaining_timeout_ms: float
+
+
+class _ResolveHashesReply(_PeerMessage, tag="hashes_resolved"):
+    """Wire reply carrying resolution results, without block data."""
+
+    op_handle: OpHandle
+    results: tuple[_ResolvedHash, ...]
+    error: str | None = None
+
+
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
     pass
 
@@ -65,6 +89,8 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 
 _ControlMessage = (
     _StartWrite
+    | _ResolveHashesRequest
+    | _ResolveHashesReply
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
@@ -72,6 +98,85 @@ _ControlMessage = (
     | _WriteProbeAck
 )
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
+
+
+@dataclass
+class _HashResolutionOp(_ProgressOp):
+    """Local state for a pending resolution exchange; never sent over the wire."""
+
+    endpoint: str
+    hashes: tuple[int, ...]
+    _backend: "_RemoteFWDram" = field(repr=False, compare=False)
+    # Delivered by owner polling; consumers can enqueue their continuation.
+    on_complete: Callable[["_HashResolutionOp"], None] = field(
+        repr=False, compare=False
+    )
+    deadline: float = field(init=False)
+    response: tuple[_ResolvedHash, ...] | None = None
+    failure: str | None = None
+    sent: bool = False
+
+    def __post_init__(self) -> None:
+        self.deadline = self._backend._kvcr._operation_deadline()
+
+    def progress(self, progress: _KVCRProgress, _event):
+        now = self._backend._kvcr._clock()
+        if self.response is not None or self.failure is not None:
+            return True, True
+        if progress._stop_requested or now >= self.deadline:
+            self.failure = "closed" if progress._stop_requested else "timeout"
+            return True, True
+        if not self.sent:
+            self.sent = self._backend._send_control(
+                progress,
+                self.endpoint,
+                _ResolveHashesRequest(
+                    op_handle=self.op_id[1],
+                    hashes=self.hashes,
+                    remaining_timeout_ms=(self.deadline - now) * 1000,
+                ),
+            )
+            if not self.sent:
+                self.failure = "control_send_failed"
+                return True, True
+            return False, True
+        return False, False
+
+    def receive(self, reply: _ResolveHashesReply) -> None:
+        if (
+            not self.sent
+            or reply.sender_control_endpoint != self.endpoint
+            or self.response is not None
+            or self.failure is not None
+        ):
+            return
+        if self._backend._kvcr._clock() >= self.deadline:
+            self.failure = "timeout"
+            return
+        if reply.error is not None:
+            self.failure = (
+                reply.error if reply.error and not reply.results else "invalid_response"
+            )
+            return
+        reply_hashes = {row.block_hash for row in reply.results}
+        if len(reply.results) != len(self.hashes) or reply_hashes != set(self.hashes):
+            self.failure = "invalid_response"
+            return
+        for row in reply.results:
+            if row.key is None:
+                valid = bool(row.reason) and not row.layout and not row.sizes
+            else:
+                valid = (
+                    bool(row.key)
+                    and row.reason is None
+                    and bool(row.layout)
+                    and len(row.layout) == len(row.sizes)
+                    and all(size > 0 for size in row.sizes)
+                )
+            if not valid:
+                self.failure = "invalid_response"
+                return
+        self.response = reply.results
 
 
 class _TargetPullState(Enum):
