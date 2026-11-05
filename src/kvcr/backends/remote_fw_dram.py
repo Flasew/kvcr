@@ -43,6 +43,7 @@ from ..types import (
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
+from .local_dram_pools import _LocalDramState
 from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
@@ -50,6 +51,9 @@ from .remote_ops import (
     _Invalidate,
     _NvtxState,
     _PeerMessage,
+    _ResolvedHash,
+    _ResolveHashesReply,
+    _ResolveHashesRequest,
     _SourceWriteOp,
     _SourceWriteState,
     _StartWrite,
@@ -597,12 +601,88 @@ class _RemoteFWDram:
                 self._dangling_ops.handle_probe(progress, payload)
             elif isinstance(payload, _WriteProbeAck):
                 self._dangling_ops.handle_probe_ack(progress, payload)
+            elif isinstance(payload, _ResolveHashesRequest):
+                self._handle_resolve_hashes(progress, payload)
             handled = True
             if handled_at is not None:
                 self._record_progress_duration(
                     f"control_{payload.__struct_config__.tag}", handled_at, "handled"
                 )
         return handled
+
+    def _handle_resolve_hashes(
+        self, progress: _KVCRProgress, request: _ResolveHashesRequest
+    ) -> None:
+        if not request.sender_control_endpoint:
+            return
+        error, rows = None, ()
+        if (
+            not math.isfinite(request.remaining_timeout_ms)
+            or request.remaining_timeout_ms <= 0
+            or not request.hashes
+            or len(set(request.hashes)) != len(request.hashes)
+            or any(not 0 <= value < 1 << 64 for value in request.hashes)
+        ):
+            error = "invalid_request"
+        elif request.sender_incarnation == self._dangling_ops.incarnation:
+            # The requester is this process: a destination cannot resolve
+            # hashes against its own cache, so refuse before any lookup.
+            error = "self_source"
+        elif progress._stop_requested:
+            error = "closed"
+        else:
+            try:
+                rows = self._resolve_hashes(request.hashes)
+            except Exception:
+                logger.warning("Hash metadata lookup failed", exc_info=True)
+                error = "resolution_failed"
+        self._send_control(
+            progress,
+            request.sender_control_endpoint,
+            _ResolveHashesReply(
+                op_handle=request.op_handle,
+                results=rows,
+                error=error,
+                # Preserve the address the requester used, including aliases.
+                sender_control_endpoint=request.source_control_endpoint,
+            ),
+        )
+
+    def _resolve_hashes(self, hashes: Collection[int]) -> tuple[_ResolvedHash, ...]:
+        """Resolve advisory identities; the later transfer claims source memory."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return tuple(
+                _ResolvedHash(value, reason="key_adapter_unavailable")
+                for value in hashes
+            )
+        core = self._kvcr
+        rows = []
+        for block_hash in hashes:
+            try:
+                key = adapter.decode_from_router(block_hash)
+            except KeyError:
+                rows.append(_ResolvedHash(block_hash, reason="not_found"))
+                continue
+            except ValueError:
+                rows.append(_ResolvedHash(block_hash, reason="ambiguous_hash"))
+                continue
+            record = core._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            layout = local.key_layout if local is not None else None
+            if (
+                local is None
+                or record.pending_invalidation
+                or local.state is _LocalDramState.DISCARDING
+                or not layout
+            ):
+                rows.append(_ResolvedHash(block_hash, reason="source_not_transferable"))
+                continue
+            sizes = tuple(
+                core._block_sizes[label.partition(":")[0]] for label in layout
+            )
+            rows.append(_ResolvedHash(block_hash, key, layout, sizes))
+        return tuple(rows)
 
     def _send_control(
         self,
@@ -623,7 +703,16 @@ class _RemoteFWDram:
         if not isinstance(payload, _TargetMetadataAck):
             payload.source_control_endpoint = endpoint
         includes_metadata = (
-            not isinstance(payload, (_TargetMetadataAck, _WriteRefused, _Invalidate))
+            not isinstance(
+                payload,
+                (
+                    _TargetMetadataAck,
+                    _WriteRefused,
+                    _Invalidate,
+                    _ResolveHashesRequest,
+                    _ResolveHashesReply,
+                ),
+            )
             and endpoint not in self._metadata_acked_sources
             and (
                 isinstance(payload, (_TargetMetadata, _StartWrite))

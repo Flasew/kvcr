@@ -40,6 +40,30 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     move: bool = False
 
 
+class _ResolvedHash(msgspec.Struct, frozen=True):
+    block_hash: int
+    key: BlockKey | None = None
+    layout: tuple[str, ...] = ()
+    sizes: tuple[int, ...] = ()
+    reason: str | None = None
+
+
+class _ResolveHashesRequest(_PeerMessage, tag="resolve_hashes"):
+    """Wire request for full keys and layouts matching advertised hashes."""
+
+    op_handle: OpHandle
+    hashes: tuple[int, ...]
+    remaining_timeout_ms: float
+
+
+class _ResolveHashesReply(_PeerMessage, tag="hashes_resolved"):
+    """Wire reply carrying resolution results, without block data."""
+
+    op_handle: OpHandle
+    results: tuple[_ResolvedHash, ...]
+    error: str | None = None
+
+
 class _Invalidate(_PeerMessage, tag="invalidate"):
     """Remove eligible source G2 copies already held completely at the destination."""
 
@@ -74,6 +98,8 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 _ControlMessage = (
     _StartWrite
     | _Invalidate
+    | _ResolveHashesRequest
+    | _ResolveHashesReply
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
