@@ -158,7 +158,15 @@ The callback names above represent services implemented by the framework adapter
 
 For `on_resilience_event` and optional framework-memory quarantine, see the [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
-See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
+See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for hint envelopes. `abort()` is currently unimplemented as it cannot be used by the frameworks.
+
+### Hash-addressed cache operations
+
+Configure `KeyAdapter.encode_to_router` and `decode_from_router` to associate complete framework keys with advertised hashes. The framework owns reverse lookup and can maintain it from `inventory_sink` events, as the vLLM adapter does. `kv.fetch` hints use `mode: "copy"` or `mode: "move"`. With a request ID, they default to advice for later framework calls; `scope: "independent"`, or no request ID, starts an independent operation using the source's hash-to-key mappings. Ordinary full-key lookup and transfer APIs are unchanged.
+
+`hints/fetch.py` parses and dispatches the hint. `runtime/independent_hint_handler.py` owns independent resolution, transfer setup, completion tracking, and claim release.
+
+Call KVCR methods from one application thread and keep polling completions on both peers. Hash metadata resolution and native transfers run on progress; destination transfer setup and source removal run on the application thread. Move completion reports destination readiness. Source removal waits for active readers and transfers, skips `no_evict` protection, and drops only eligible G2 copies. See [hash-addressed operations](hash_management.md) for payloads, completion reporting, and identity requirements.
 
 ### Development loop
 
@@ -191,6 +199,31 @@ Run the complete framework-neutral suite before considering a KVCR-only change v
 ```bash
 uv run pytest -q
 ```
+
+### Native hash-operation tests
+
+`tests/e2e/run_hash_operations.py` exercises independent fetch/move hints with two KVCR processes, real NIXL transfers, and ZMQ peer control. It checks unrelated carrier requests, source-removal safety, and hash collisions at the KVCR boundary. Hints pass through JSON decoding before `submit_hint`. The suite needs neither vLLM nor Dynamo and does not run an inference engine or router.
+
+The native scenarios verify bytes in every named piece, inventory changes, and claim/advice/operation cleanup. They cover copy and move, retained sources and existing readers, cached destinations, mixed successful/missing/ambiguous hashes, duplicate hashes, collision recovery, and multiple actions sharing a carrier. Controlled source-disappearance races pause the destination's continuation after its real resolution reply. Removing or replacing the source then tests admission against the resolved full key. Ordinary framework fallback after source removal is checked using registered CPU buffers and a small framework callback fixture.
+
+```bash
+PYTHONPATH=src UCX_TLS=tcp,sm,self,cuda_copy \
+  uv run python tests/e2e/run_hash_operations.py \
+  --output-dir /tmp/kvcr-hash-operations
+```
+
+Use a new output directory outside the checkout. TCP makes this CPU-buffer correctness test portable across hosts. `--case NAME` selects a case (repeat the option for several cases); `--repeat N` repeats the selection, and `--block-size` sets bytes per piece. The JSON report records case outcomes and source hashes.
+
+The unit tests complement native coverage with deterministic failure injection:
+
+| Test file | Additional checks |
+| --- | --- |
+| `tests/unit/test_hash_resolution.py` | Reply validation, endpoint identity, duplicates, timeouts, late replies, and lookup without the owner lock |
+| `tests/unit/test_cache_management.py` | All copy/move overlap combinations, partial destinations, per-action results, real fetch setup errors, and late move notifications |
+
+The race tests use continuation gates, explicit notifications, or fake clocks to establish ordering; elapsed sleeps do not decide which operation wins. A move can still report failure after successful source removal when the destination misses its final notification deadline; the tests preserve that existing contract.
+
+`tests/e2e/run_vllm_manager_hash.py` repeats the copy, move, group-collision, and unknown-hash cases through two production vLLM `KVCRSecondaryTierManager` instances with real KVCR, NIXL, and ZMQ: inventory populates the vLLM adapter, hints enter through `on_new_request`, and later loads read the placed copy. It needs a vLLM installation with the KVCR tier (for example the quick-start image) and this checkout's `src` first on `PYTHONPATH`. The mocked `tests/v1/kv_offload/tiering/test_kvcr_tier.py` in vLLM covers the manager's inventory state machine without KVCR.
 
 ### Code quality
 

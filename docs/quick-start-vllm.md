@@ -246,4 +246,10 @@ The explicit rank selection is only for this deterministic mechanism test. In a 
 - **No router hint or cache hit:** Use `--router-mode kv`, enable self-describing KV events, and confirm the worker advertises `router_hint` and its control endpoints. Use a fresh prefix longer than one block.
 - **Peer connection or transfer failure:** Ensure control and event ports are unique, with one control port per DP rank, and `control_advertise_host` is reachable by peers. Check terminal transfer status and destination data; a control acknowledgement alone does not prove delivery.
 
+The pinned router emits request-scoped `kv.fetch` advice, and the vLLM adapter
+loads through copy-only `deliver`. Executing move advice requires managed
+`fetch`. Independent `kv.fetch` hints with `scope: "independent"` also require
+managed destination G2 capacity, which this peer-only quick start does not
+configure. See [hash-addressed operations](hash_management.md).
+
 For more checks, see the [developer guide](dev-guide.md#troubleshooting).

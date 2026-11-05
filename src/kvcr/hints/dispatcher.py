@@ -47,8 +47,9 @@ def _warn_handler_error(action_type: str, phase: str) -> None:
 class _HintHandler(Protocol):
     """Executes one action type.
 
-    ``submit`` runs on the caller's thread without the state lock, once per
-    hint, and must report exactly one result for it.
+    ``submit`` is invoked on the caller's thread without the state lock and
+    reports one admission result. Independent cache operations acquire the
+    lock as needed and subsequently report asynchronous completion.
     """
 
     action_type: str
@@ -105,9 +106,9 @@ class HintDispatcher:
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        # Contract: a handler reports the hint exactly once, or raises before
-        # doing so. Inline hints are terminal at submit time, so a raise
-        # means REJECTED, unless the raise is the fatal progress-thread
+        # Contract: a handler reports admission exactly once, or raises before
+        # doing so. ACCEPTED means admission, not asynchronous completion.
+        # A raise means REJECTED, unless it is the fatal progress-thread
         # failure, which propagates to the caller as it does without hints.
         try:
             handler.submit(hint, request_id, message_id)
@@ -133,11 +134,12 @@ class HintDispatcher:
         forward KVCR stats and may reject names they do not declare.
         """
         logger.debug(
-            "KV hint result; action_id=%s action_type=%s status=%s reason=%s",
+            "KV hint result; action_id=%s action_type=%s status=%s reason=%s op=%s",
             result.action_id,
             result.action_type,
             result.status.value,
             result.reason,
+            result.op_handle,
         )
 
     # Main thread, under the state lock.

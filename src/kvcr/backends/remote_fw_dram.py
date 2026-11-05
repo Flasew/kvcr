@@ -48,6 +48,7 @@ from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
     _decode_notif,
+    _HashResolutionOp,
     _Invalidate,
     _NvtxState,
     _PeerMessage,
@@ -171,7 +172,9 @@ class _RemoteFWDram:
         request_id: str | None,
         *,
         move: bool = False,
+        timed: bool = True,
     ) -> None:
+        """Record advice; ``timed`` advice measures router lead time as hint_wait."""
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
@@ -200,7 +203,9 @@ class _RemoteFWDram:
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
                     else kvcr._timer()
-                ),
+                )
+                if timed
+                else None,
                 trace=trace,
                 move=move,
             )
@@ -400,6 +405,8 @@ class _RemoteFWDram:
                 self._kvcr._invalidation_handler.submit(
                     item.keys, key_layout=item.key_layout
                 )
+            elif isinstance(item, _HashResolutionOp):
+                self._kvcr._independent_hint_handler._resolved.append(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -603,6 +610,10 @@ class _RemoteFWDram:
                 self._dangling_ops.handle_probe_ack(progress, payload)
             elif isinstance(payload, _ResolveHashesRequest):
                 self._handle_resolve_hashes(progress, payload)
+            elif isinstance(payload, _ResolveHashesReply):
+                op = progress._in_flight_ops.get(("resolve_hashes", payload.op_handle))
+                if isinstance(op, _HashResolutionOp):
+                    op.receive(payload)
             handled = True
             if handled_at is not None:
                 self._record_progress_duration(
