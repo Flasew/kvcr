@@ -79,6 +79,7 @@ class _RequestHint:
     source: str | None
     block_hashes: frozenset[int]
     submitted_at: float | None
+    move: bool = False
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -169,6 +170,8 @@ class _RemoteFWDram:
         src: str | None,
         block_hashes: frozenset[int],
         request_id: str | None,
+        *,
+        move: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -194,6 +197,7 @@ class _RemoteFWDram:
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
+                move=move,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -217,11 +221,34 @@ class _RemoteFWDram:
         ):
             return False
         if (
-            not self._options.opportunistic_query
-            and adapter.encode_to_router(key) not in request_hint.block_hashes
-        ):
+            request_hint.move or not self._options.opportunistic_query
+        ) and adapter.encode_to_router(key) not in request_hint.block_hashes:
             return False
         return True
+
+    def prepare_migration(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str | None,
+        layout: tuple[str, ...],
+    ) -> "_NamedSource | None":
+        """Snapshot matching move advice when a full-key fetch is admitted."""
+        from .local_dram import _NamedSource
+
+        hint = self._request_hints.get(request_id)
+        if (
+            hint is None
+            or not hint.move
+            or hint.source is None
+            or hint.source == getattr(self._control, "endpoint", None)
+        ):
+            return None
+        matched = {key for key in keys if self.query(key, request_id)}
+        return (
+            _NamedSource(hint.source, layout, matched, move=True, g2_only=False)
+            if matched
+            else None
+        )
 
     def _start_target_pull(
         self,
@@ -277,7 +304,7 @@ class _RemoteFWDram:
             # Explicit operations have no request advice to update on completion.
             request_id=request_id if current_hint is not None else None,
             move=named_source is not None and named_source.move,
-            g2_only=named_source is not None,
+            g2_only=named_source.g2_only if named_source is not None else False,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
                 if local_fill

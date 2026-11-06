@@ -199,7 +199,8 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     _poll_until(target, bool)
 
 
-def test_remote_fetch_uses_local_then_framework_sources() -> None:
+@pytest.mark.parametrize("action_type", ["kv.fetch", "kv.migrate"])
+def test_remote_fetch_uses_local_then_framework_sources(action_type) -> None:
     block_size = 16
     source_primary = ctypes.create_string_buffer(b"b" * block_size)
     source_local = ctypes.create_string_buffer(block_size * 2)
@@ -252,7 +253,9 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     ]
     source_agent.state = "PROC"
 
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=action_type)
+    target.submit_hint(hint, request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -286,13 +289,16 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     source_now = 0.25
     source_agent.state = "DONE"
     assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
-    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
+    if action_type == "kv.migrate":
+        assert source.query((keys[0],)) == [(QueryStatus.MISS, None)]
+    else:
+        assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
     assert source_pinning.unpins == ["pin"]
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in source_policy.scored
         if meta.block_key == keys[0]
-    ] == [(0, 0.0), (1, 0.25)]
+    ] == ([(0, 0.0)] if action_type == "kv.migrate" else [(0, 0.0), (1, 0.25)])
 
     target_agent.notifs["source"] = [notification]
     completed = dict(_poll_until(target, lambda results: bool(results)))
@@ -1873,8 +1879,9 @@ def test_move_rejects_invalid_source_before_admission(pair, endpoint):
         (2, True, True),
     ],
 )
+@pytest.mark.parametrize("migrate", [False, True], ids=["explicit", "request"])
 def test_move_bytes_removal_protection_and_cache_hits(
-    pair, cached, protected, succeeds
+    pair, cached, protected, succeeds, migrate
 ):
     source, target = pair.source, pair.target
     keys = (BlockKey(b"first"), BlockKey(b"second"))
@@ -1884,9 +1891,19 @@ def test_move_bytes_removal_protection_and_cache_hits(
     source.events.clear()
     target.events.clear()
     before = len(source.agent.xfers)
-    handle = target.kvcr._core.fetch(
-        keys, source_endpoint=source.control.endpoint, move=True
-    )
+    if migrate:
+        target.kvcr._core._remote_fw_dram._key_adapter = _ConstantHashAdapter()
+        hint = _router_hint(source.control.endpoint)
+        hint.actions[0] = msgspec.structs.replace(
+            hint.actions[0], action_type="kv.migrate"
+        )
+        target.kvcr.submit_hint(hint, request_id="req")
+        assert len(source.agent.xfers) == before
+        handle = target.kvcr.fetch(keys, request_id="req")
+    else:
+        handle = target.kvcr._core.fetch(
+            keys, source_endpoint=source.control.endpoint, move=True
+        )
     pair.until(lambda: len(source.agent.xfers) > before or handle in target.results)
     if not protected:
         pair.until(lambda: source.kvcr.query(keys) == [(QueryStatus.MISS, None)] * 2)

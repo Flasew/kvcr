@@ -84,7 +84,10 @@ class _FetchHintHandler:
         # One store call per hint; the store's own rules apply (a later hint
         # replaces the request's hashes, a different source fails the request).
         self._core._remote_fw_dram.submit_hint(
-            hint.source_endpoint, hint.block_hashes, request_id
+            hint.source_endpoint,
+            hint.block_hashes,
+            request_id,
+            move=self.action_type == "kv.migrate",
         )
         self._dispatcher.report(
             HintResult(

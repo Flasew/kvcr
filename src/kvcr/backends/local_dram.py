@@ -54,6 +54,7 @@ class _NamedSource:
     layout: tuple[str, ...]
     keys: set[BlockKey]
     move: bool = False
+    g2_only: bool = True
     cached_keys: list[BlockKey] = field(default_factory=list)
 
     def invalidate_cached(self, core: "_KVCRCore") -> None:

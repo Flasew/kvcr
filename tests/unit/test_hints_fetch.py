@@ -4,6 +4,7 @@
 
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 from _kvcr_test_utils import (
     FakeBytesControl,
@@ -219,6 +220,110 @@ def _idle(pair):
             assert (
                 record.local_dram.claim_count == record.local_dram.source_readers == 0
             )
+
+
+def test_migrate_only_invalidates_hash_matched_cache_hits(monkeypatch):
+    """Unadvertised source copies survive, even with opportunistic querying."""
+    pair = _pair()
+    source, target = pair.source, pair.target
+    source.deposit(_KEY)
+    source.deposit(_TAIL_KEY, 1)
+    target.deposit(_TAIL_KEY, 1)
+    target.deposit(_KEY)
+    remote = target.kvcr._core._remote_fw_dram
+    remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
+    reports = _record_hint_results(monkeypatch, target.kvcr)
+    _submit(pair, "kv.migrate", "req")
+    assert not remote.query(_KEY, "unrelated") and not remote.query(_TAIL_KEY, "req")
+    fetched = target.kvcr.fetch((_KEY, _TAIL_KEY), "req")
+    pair.until(
+        lambda: fetched in target.results and source.kvcr.query((_KEY,)) == [_MISS]
+    )
+    results = target.results.pop(fetched)
+    assert all(entry.success for entry in results.values())
+    assert source.kvcr.query((_KEY, _TAIL_KEY)) == [
+        _MISS,
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert _take(reports) == [("action", HintStatus.ACCEPTED, None)]
+    assert all(
+        ok
+        for _, ok in target.kvcr.release([r.release_handle for r in results.values()])
+    )
+    _idle(pair)
+
+
+def test_migrate_waits_for_destination_pieces_and_keeps_admission_source():
+    """Discarding/replacing advice cannot retarget a migration waiting on a write."""
+    pair = _pair()
+    source, target = pair.source, pair.target
+    layout = ["", ":tail"]
+    source.agent.state = "DONE"
+    deposited = source.kvcr.deposit(
+        {_KEY: [source.ref(), source.ref(1, ":tail")]}, expected_layout=layout
+    )
+    assert dict(_poll_until(source.kvcr, bool))[deposited][_KEY].success
+    deposited = target.kvcr.deposit({_KEY: [target.ref()]}, expected_layout=layout)
+    _wait_until(lambda: bool(target.agent.xfers))
+    before = len(source.agent.xfers)
+    _submit(pair, "kv.migrate", "req")
+    fetched = target.kvcr.fetch((_KEY,), "req", expected_layout=layout)
+    pending = target.kvcr._core._local_dram._pending_residency_ops[("fetch", fetched)]
+    assert pending.deadline == target.kvcr._core.config.abandon_timeout_ms / 1000
+    assert not pending.remote_fill_keys and len(source.agent.xfers) == before
+    target.kvcr.discard_hint("req")
+    remote = target.kvcr._core._remote_fw_dram
+    remote.submit_hint("tcp://replacement:1", frozenset({124}), "req")
+    replacement = remote._request_hints["req"]
+    target.agent.state = "DONE"
+    pair.until(lambda: fetched in target.results and pair.idle())
+    assert target.results.pop(deposited)[_KEY].success
+    result = target.results.pop(fetched)[_KEY]
+    assert result.success and target.local.raw == b"a" * 16 + b"b" * 16
+    assert source.kvcr.query((_KEY,)) == [_MISS]
+    assert remote._request_hints["req"] is replacement
+    writes = [_decode_control_message(raw) for _, raw in target.control.sent]
+    (write,) = [request for request in writes if request["type"] == "start_write"]
+    assert write["source_control_endpoint"] == source.control.endpoint
+    assert target.kvcr.release((result.release_handle,)) == [
+        (result.release_handle, True)
+    ]
+    _idle(pair)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_migrate_deliver_still_copies(cached):
+    """Direct delivery follows PR154: only full-key fetch initiates migration."""
+    pair = _pair()
+    pair.source.deposit(_KEY)
+    if cached:
+        pair.target.deposit(_KEY)
+    _submit(pair, "kv.migrate", "req")
+    delivered = pair.target.kvcr.deliver({_KEY: [pair.target.ref(1)]}, "req")
+    pair.source.agent.state = pair.target.agent.state = "DONE"
+    pair.until(lambda: delivered in pair.target.results and pair.idle())
+    assert pair.target.results.pop(delivered)[_KEY].success
+    assert pair.target.primary.raw[16:] == b"a" * 16
+    assert pair.source.kvcr.query((_KEY,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    _idle(pair)
+
+
+def test_migrate_self_source_keeps_cached_copy(monkeypatch):
+    pair = _pair()
+    pair.target.deposit(_KEY)
+    hint = _fetch("self", pair.target.control.endpoint, [123], "kv.migrate")
+    pair.target.kvcr.submit_hint(_fetch_envelope(hint), "req")
+    progress = pair.target.kvcr._core._progress
+    submitted = Mock(wraps=progress.submit)
+    monkeypatch.setattr(progress, "submit", submitted)
+    fetched = pair.target.kvcr.fetch((_KEY,), "req")
+    result = dict(pair.target.kvcr.poll_completed())[fetched][_KEY]
+    assert result.success
+    submitted.assert_not_called()
+    assert pair.target.kvcr.release((result.release_handle,)) == [
+        (result.release_handle, True)
+    ]
+    assert pair.target.kvcr.query((_KEY,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
 
 
 @pytest.mark.parametrize("action", ["kv.prefetch", "kv.move"])

@@ -259,9 +259,9 @@ KVCR-owned inventory events use the same full `BlockKey` values as fetch. Reques
 
 A `kv.fetch` hint identifies a source control endpoint and advertised block hashes for one request. `submit_hint` stores this advice and may establish the peer connection, but starts no block transfer or remote pinning. The framework supplies full `BlockKey` values through later `fetch()` or `deliver()` calls with the same request ID; the configured key adapter matches those keys against the hint hashes. Both calls copy without requesting source removal.
 
-Failed or conflicting advice does not prevent local cache hits. `discard_hint` clears request advice without cancelling already-started operations. A `kv.fetch` without a request ID does not execute an independent operation. Source-less hints and `no_retain` are unsupported.
+Failed or conflicting advice does not prevent local cache hits. `discard_hint` clears request advice without cancelling already-started operations. A `kv.fetch` or `kv.migrate` without a request ID does not execute an independent operation. Source-less hints and `no_retain` are unsupported.
 
-We plan to add a request-scoped `kv.migrate` hint to move KV cache for cold starts.
+`kv.migrate` stores the same request advice, but a later `fetch()` moves matching keys, including invalidating source copies already cached at the destination. Hash matching is required even with opportunistic querying enabled. It uses the existing move timeout and removal rules, while permitting framework-memory fallback. `deliver()` still copies because it may request only part of a key. Submitting or querying the hint starts no transfer, and discarding it does not cancel an admitted migration.
 
 ### Independent hints
 

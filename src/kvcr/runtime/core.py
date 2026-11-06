@@ -751,7 +751,9 @@ class _KVCRCore:
             named_source = (
                 _NamedSource(source_endpoint, declaration, set(ordered_keys), move)
                 if source_endpoint is not None
-                else None
+                else self._remote_fw_dram.prepare_migration(
+                    ordered_keys, request_id, declaration
+                )
             )
             sources = {}
             for key in ordered_keys:
@@ -762,7 +764,7 @@ class _KVCRCore:
                     and residency.ready_indices(requested) is not None
                 ):
                     continue
-                if named_source is not None:
+                if named_source is not None and key in named_source.keys:
                     sources[key] = CacheTier.REMOTE_G2
                 elif self._g3 is not None and self._g3.is_ready(key):
                     if not self._g3.is_ready(key, declaration):
@@ -775,7 +777,7 @@ class _KVCRCore:
                 ):
                     sources[key] = CacheTier.REMOTE_G2
             deadline = self._operation_deadline()
-            if move:
+            if named_source is not None and named_source.move:
                 # Accept delayed completion using the existing abandonment budget.
                 # The source independently caps its native transfer timeout.
                 deadline += (

@@ -3,6 +3,7 @@
 | Hint | Behavior |
 | --- | --- |
 | `kv.fetch` | Stores request-scoped source advice; framework `fetch()` / `deliver()` calls initiate ordinary copying. |
+| `kv.migrate` | Stores request-scoped source advice; framework `fetch()` moves matching full keys, while `deliver()` still copies. No reverse hash lookup is needed. |
 | `kv.prefetch` | Resolves advertised hashes and copies their full blocks into destination G2. |
 | `kv.move` | Resolves advertised hashes and invokes the internal move mechanism. |
 
