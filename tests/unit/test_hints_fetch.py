@@ -154,3 +154,21 @@ def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
     kvcr.submit_hint(_router_hint("tcp://a:1", (1,)))
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, None)]
     assert not kvcr._core._remote_fw_dram._request_hints
+
+
+@pytest.mark.parametrize("action_type", ["kv.prefetch", "kv.move"])
+@pytest.mark.parametrize("request_id", [None, "req"])
+def test_independent_hint_envelopes_are_not_connected(
+    monkeypatch, action_type, request_id
+):
+    kvcr, results = _fetch_kvcr(monkeypatch)
+    action = _HintAction(
+        "a1", action_type, "1.0", _fetch("a1", "tcp://a:1", [1]).payload
+    )
+    kvcr.submit_hint(_fetch_envelope(action), request_id)
+    assert [(r.action_type, r.status, r.reason) for r in results] == [
+        (action_type, HintStatus.REJECTED, "unsupported")
+    ]
+    assert results[0].request_id == request_id and results[0].message_id == "m1"
+    assert not kvcr._core._remote_fw_dram._request_hints
+    assert kvcr._core._outstanding_operations == 0 and not kvcr.poll_completed()

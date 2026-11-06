@@ -109,7 +109,8 @@ def test_dispatcher_owns_the_hint_type_table(monkeypatch):
     # table, and a type added to the table appears in a fresh dispatcher
     # without any core change.
     kvcr = _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
-    assert set(kvcr._core._hints_dispatcher._handlers) == {"kv.fetch"}
+    registered = {hint.action_type for hint in _HINT_TYPES}
+    assert set(kvcr._core._hints_dispatcher._handlers) == registered
 
     built_for: list[tuple[object, object]] = []
 
@@ -122,7 +123,7 @@ def test_dispatcher_owns_the_hint_type_table(monkeypatch):
         (*_HINT_TYPES, HintType("kv.test", "1.0", lambda i, p: _StubHint(i), factory)),
     )
     dispatcher = HintDispatcher(kvcr._core)
-    assert set(dispatcher._handlers) == {"kv.fetch", "kv.test"}
+    assert set(dispatcher._handlers) == registered | {"kv.test"}
     assert built_for == [(kvcr._core, dispatcher)]
 
 

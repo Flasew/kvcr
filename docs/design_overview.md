@@ -253,7 +253,7 @@ The router maintains an eventually-consistent global prefix inventory for cache-
 
 Framework-owned memory is reported through the framework's existing router event path. If needed, `tier_enter`/`tier_exit` reporting or `inventory_snapshot()` can be added to the KVCR API later.
 
-KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
+KVCR-owned inventory events use the same full `BlockKey` values as fetch. Request-scoped hints instead carry hashes interpreted by the configured key adapter. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
 ### Request-scoped hints
 
@@ -265,9 +265,25 @@ KVCR-to-KVCR movement is destination-initiated. A router hint gives the destinat
 
 The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
+In the current implementation, `kv.fetch` requires a source control endpoint and carries advertised block hashes. The framework supplies complete `BlockKey` values with the same request ID; the key adapter matches those keys against the hint hashes. There is no hash-to-key index for autonomous operations on unrelated hashes, and `no_retain` and source-less hints are not implemented.
+
+Both `fetch` and `deliver` copy without requesting source removal. Failed or conflicting advice does not prevent local cache hits. `discard_hint` clears request advice without cancelling already-started operations.
+
+### Move and source invalidation
+
+The `kv.prefetch` and `kv.move` envelopes carry a source endpoint and block hashes for independent operations. They currently report unsupported; they are not connected to transfers or the internal move mechanism.
+
+The internal move mechanism accepts complete keys and a source endpoint, reusing fetch admission and transfers without adding a public framework API. The transfer request carries a move flag. Source keys with incomplete G2 copies or unfinished deposits fail individually before withdrawal; their deposits can still finish. The source admits moves on its owner thread, where the affected keys stop accepting new reads and deposits while existing operations retain their claims; the write itself still runs on the progress thread. Successful native transfer leaves removal pending before the source transfer claim is released; failed transfer reopens admission and keeps the copy. There is no destination completion confirmation or wait for source cleanup.
+
+A destination reuses complete copies it already holds; the move handler sends the named source one `invalidate` message for those keys. For partly cached keys, unfinished destination writes settle before the source transfers the remaining pieces. A move joining an existing copy waits for that copy, then handles the complete key as a cache hit. Results contain ordinary fetch release handles protecting the destination copies.
+
+The destination uses `abandon_timeout_ms` as its move completion allowance; the source retains its normal transfer timeout. This tolerates delayed completion processing, but a destination that exceeds the longer allowance can still fail after the source has removed its copy. Existing cancellation and buffer-quarantine rules continue to protect memory until native access stops.
+
+Removal affects only KVCR-owned G2 copies in the requested complete layout, after earlier operations and readers drain. `deposit(no_evict=True)` protection is honored; framework-owned memory and G3 copies are retained. Actual source removal and newly complete destination copies publish the corresponding `inventory_sink` events. Removal remains best effort, with no separate public outcome. Control messages assume trusted peers; a move naming this node's own control endpoint is rejected.
+
 ### Peer control and liveness
 
-The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints remain request-scoped rather than becoming part of global block state, so this coordination adds no KVCR-side peer inventory.
+The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints belong to request advice or an explicit move operation rather than global block state, so this coordination adds no KVCR-side peer inventory.
 
 Peer transfers use a separate control channel for connection metadata, acknowledgements, and transfer control; payload bytes move directly through NIXL and never traverse the router or control channel. Peer-protocol versioning and compatibility checks may be added as needed.
 
@@ -313,7 +329,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims prevent eviction while held. Move uses the source invalidation rules above rather than a policy eviction decision. `no_retain` is not currently supported.
 
 The policy methods are invoked as follows:
 
