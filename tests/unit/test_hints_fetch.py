@@ -29,7 +29,7 @@ from kvcr.config import KVCRConfig, RemoteFWDramOptions
 from kvcr.hints.dispatcher import _LOGGED_HANDLER_ERRORS
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES
 from kvcr.hints.results import HintStatus
-from kvcr.types import BlockKey, CacheTier, QueryStatus
+from kvcr.types import BlockKey, CacheTier, OpEntryStatus, QueryStatus
 
 
 @pytest.fixture(autouse=True)
@@ -196,6 +196,7 @@ def _idle(pair):
         core = peer.kvcr._core
         handler = core._independent_hint_handler
         assert not handler._received and not handler._pending_operations
+        assert not core._remote_fw_dram._no_retain_ops
         assert not core._framework_pin_keys and not core._local_dram_sources_by_op
         for record in core._block_record_map.values():
             if record.local_dram is not None:
@@ -209,22 +210,32 @@ def _idle(pair):
 
 @pytest.mark.parametrize("operation", ["fetch", "deliver"])
 @pytest.mark.parametrize("succeeds", [False, True])
+@pytest.mark.parametrize("no_retain", [False, True])
 def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
-    pair, operation, succeeds
+    pair, operation, succeeds, no_retain
 ):
     source, target = pair.source, pair.target
     source.deposit(_TAIL_KEY, 1)
+    marked = target.kvcr._core._no_retain
+    marked.update(() if no_retain else (_KEY,))
     target.kvcr._core._key_adapter = SimpleNamespace(
         encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
     )
     remote = target.kvcr._core._remote_fw_dram
     remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
     hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
+    hint.payload["no_retain"] = no_retain
     target.kvcr.submit_hint(_envelope(hint), "req")
+    advice = remote._request_hints["req"]
     blocks = {_KEY: [target.ref()], _TAIL_KEY: [target.ref(1)]}
     writes = len(source.agent.xfers)
     handle = getattr(target.kvcr, operation)(blocks, "req")
     pair.until(lambda: len(source.agent.xfers) > writes)
+    if operation == "fetch":
+        hint.payload["no_retain"] = not no_retain
+        target.kvcr.submit_hint(_envelope(hint), "req")
+    else:
+        target.kvcr.discard_hint("req")
     target.kvcr._core._clock = lambda: 0.9
     source.agent.state = "DONE" if succeeds else "ERR"
     if not succeeds:
@@ -233,6 +244,10 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     pair.until(lambda: handle in target.results and pair.idle())
     results = target.results.pop(handle)
     assert results[_KEY].success is succeeds and not results[_TAIL_KEY].success
+    assert marked == ({_KEY} if (no_retain == succeeds) else set())
+    assert advice.no_retain_applied == ({_KEY} if succeeds else set())
+    if operation == "fetch":
+        assert not remote._request_hints["req"].no_retain_applied
     if operation == "deliver":
         # Never attempted, whatever happened to the block that was.
         assert results[_TAIL_KEY].reason == "hint_unavailable"
@@ -278,6 +293,7 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, mov
         encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
     )
     hint = _fetch("action", endpoint, (123, 124), "kv.evict_on_fetch")
+    hint.payload["no_retain"] = True
     target.kvcr.submit_hint(_envelope(hint), "req")
     held, send = [], target.control.send
 
@@ -309,6 +325,7 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, mov
     results = target.results.pop(handle)
     accepted = keys[:1] if ack == "partial" else keys
     assert {key for key, result in results.items() if result.success} == set(accepted)
+    assert core._no_retain == set(accepted)
     [message] = held
     assert set(message["keys"]) == set(accepted)
     for key in keys:
@@ -339,6 +356,111 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, mov
     assert source.kvcr.query(keys) == expected
 
 
+@pytest.mark.parametrize("protected", [False, True])
+def test_no_retain_deposit_lifetime(pair, protected):
+    target, core = pair.target, pair.target.kvcr._core
+    kvcr, blocks = target.kvcr, {_KEY: [target.ref()]}
+    core._key_adapter = SimpleNamespace(encode_to_router=lambda key: 123)
+    hint = _fetch("action", pair.source.control.endpoint, [123])
+    hint.payload["no_retain"] = True
+    kvcr.submit_hint(_envelope(hint), "req")
+    handle = kvcr.fetch(blocks, "req")
+    assert not core._no_retain
+    pair.source.agent.state = target.agent.state = "DONE"
+    pair.until(lambda: handle in target.results and pair.idle())
+    entry = target.results.pop(handle)[_KEY]
+    assert entry.success
+    kvcr.release([entry.release_handle])
+    assert core._no_retain == {_KEY}
+    deposited = kvcr.deposit(blocks, no_evict=protected)
+    entry = dict(_poll_until(kvcr, bool))[deposited][_KEY]
+    expected = OpEntryStatus.SUCCESS if protected else OpEntryStatus.DROPPED
+    assert entry.status is expected
+    if entry.release_handle is not None:
+        kvcr.release([entry.release_handle])
+    delivered = kvcr.deliver(blocks, "req")
+    assert dict(_poll_until(kvcr, bool))[delivered][_KEY].success
+    assert not core._no_retain  # An undiscarded hint cannot rearm after deposit.
+    _idle(pair)
+
+
+@pytest.mark.parametrize("no_retain", [False, True])
+def test_no_retain_matching_advice_applies_once(pair, caplog, no_retain):
+    target, core = pair.target, pair.target.kvcr._core
+    keys, mapping = (_KEY, _TAIL_KEY), {_KEY: 123, _TAIL_KEY: 124}
+    for index, key in enumerate(keys):
+        target.deposit(key, index)
+    target.agent.state = "DONE"
+    core._key_adapter = SimpleNamespace(encode_to_router=mapping.__getitem__)
+    core._no_retain.update(keys if no_retain else ())
+    hint = _fetch("action", pair.source.control.endpoint, [123, 124])
+    for request, enabled in (("a", no_retain), ("b", not no_retain)):
+        hint.payload["no_retain"] = enabled
+        target.kvcr.submit_hint(_envelope(hint), request)
+
+    def deliver(selected, request):
+        blocks = {key: [target.ref(keys.index(key))] for key in selected}
+        handle = target.kvcr.deliver(blocks, request)
+        entries = dict(_poll_until(target.kvcr, bool))[handle]
+        assert all(entry.success for entry in entries.values())
+
+    deliver(keys[:1], "a")  # A no-op still consumes A's advice for this key.
+    deliver(keys[:1], "b")
+    deliver(keys, "a")
+    assert core._no_retain == ({_TAIL_KEY} if no_retain else {_KEY})
+    core._no_retain.update(keys)
+    hint.payload.pop("no_retain")  # Omission is false; clear only advertised keys.
+    hint.payload["block_hashes"] = [124]
+    target.kvcr.submit_hint(_envelope(hint), "a")
+    deliver(keys, "a")
+    deliver(keys, "absent")
+    assert core._no_retain == {_KEY}  # Neither call clears this unadvertised key.
+    target.deposit(_TAIL_KEY, 1)  # Disabled advice allows this full deposit.
+    target.agent.state = "DONE"
+    hint.payload["no_retain"] = True
+    target.kvcr.submit_hint(_envelope(hint), "a")
+    mapping.clear()  # Adapter failures must not lose the delivery result.
+    deliver(keys[1:], "a")
+    assert core._no_retain == {_KEY}
+    assert "KVCR no_retain marking failed" in caplog.text
+    _idle(pair)
+
+
+@pytest.mark.parametrize("case", ["fresh", "existing", "protected"])
+def test_no_retain_partial_deposit(pair, case):
+    target, core = pair.target, pair.target.kvcr._core
+    kvcr, layout = target.kvcr, ["", ":tail"]
+    target.agent.state = "DONE"
+    if case != "fresh":
+        first = kvcr.deposit({_KEY: [target.ref()]}, expected_layout=layout)
+        assert dict(_poll_until(kvcr, bool))[first][_KEY].success
+    core._no_retain.add(_KEY)
+    if case in ("existing", "protected"):
+        blocks = {_KEY: [target.ref(), target.ref(1, ":wrong")]}
+        op = kvcr.deposit(blocks, no_evict=case == "protected")
+        assert dict(_poll_until(kvcr, bool))[op][_KEY].status is OpEntryStatus.FAILED
+    partial = kvcr.deposit(
+        {_KEY: [target.ref(1, ":tail")]},
+        expected_layout=layout,
+        no_evict=case == "protected",
+    )
+    entry = dict(_poll_until(kvcr, bool))[partial][_KEY]
+    expected = OpEntryStatus.SUCCESS if case == "protected" else OpEntryStatus.DROPPED
+    assert entry.status is expected
+    assert core._no_retain == {_KEY}
+    if case == "fresh":
+        assert _KEY not in core._block_record_map
+    else:
+        pending = core._block_record_map[_KEY].local_dram.pending_labels
+        assert pending == (None if case == "protected" else {":tail"})
+    whole = kvcr.deposit({_KEY: [target.ref(), target.ref(1, ":tail")]})
+    assert dict(_poll_until(kvcr, bool))[whole][_KEY].status is expected
+    assert not core._no_retain
+    if entry.release_handle is not None:  # Release the existing no_evict claim.
+        kvcr.release([entry.release_handle])
+    _idle(pair)
+
+
 @pytest.mark.parametrize(
     "reason",
     [
@@ -346,6 +468,7 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, mov
         "key_adapter_unavailable",
         "self_destination",
         "destination-less hints are not currently supported",
+        "no_retain is not supported by this hint",
     ],  # fmt: skip
 )
 @pytest.mark.parametrize("action_type", ["kv.prefetch", "kv.move"])
@@ -361,6 +484,8 @@ def test_independent_hints_are_rejected_at_the_source_before_resolution(
     elif reason == "key_adapter_unavailable":
         kvcr._core._key_adapter = None
     hint = _independent("a1", destination, [1], action_type)
+    if reason.startswith("no_retain"):
+        hint.payload["no_retain"] = False
     if reason.startswith("destination-less"):
         hint.payload["source_control_endpoint"] = hint.payload.pop(
             "destination_control_endpoint"

@@ -257,7 +257,7 @@ KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_
 
 ### KV transfer hints
 
-For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
+For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it. `no_retain` is supported only on request-scoped `kv.fetch` and `kv.evict_on_fetch` hints.
 
 The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
@@ -327,7 +327,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. A full-key deposit consumes its `no_retain` mark even when `no_evict` retains the data; releasing the claim does not restore the mark. Unprotected partial deposits are logged and dropped without consuming the mark. Marks survive request cleanup and cache eviction, with no automatic expiry or size limit.
 
 The policy methods are invoked as follows:
 

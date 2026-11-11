@@ -317,6 +317,7 @@ class _LocalDram:
         dst_descriptors: list[_TransferRef] = []
         evicted: list[BlockKey] = []
         declared_local = list(op.key_layout) if op.key_layout is not None else None
+        no_retain = self._kvcr._no_retain
         for key in keys:
             if key in op.results or key in op.capacity_waiters or key in op.active_keys:
                 continue
@@ -337,7 +338,26 @@ class _LocalDram:
                 ):
                     op.results[key] = _FAILED_RESULT
                     continue
-            else:
+            if no_retain and key in no_retain:
+                declaration = op.key_layout
+                if residency is not None:
+                    declaration = residency.key_layout
+                    if _layout_indices(residency.layout, layout) is None:
+                        op.results[key] = _FAILED_RESULT
+                        continue
+                protected = op.claim_on_ready or bool(
+                    residency is not None and residency.retention_claims
+                )
+                if declaration is None or len(layout) == len(declaration):
+                    no_retain.discard(key)
+                elif not protected:
+                    # Partial key deposit for no_retain keys is ignored.
+                    # A partial copy may remain cached and ineligible for eviction.
+                    logger.warning("KVCR ignored partial no_retain deposit: %r", key)
+                if not protected:
+                    op.results[key] = _DROPPED_RESULT
+                    continue
+            if residency is None:
                 declaration = op.key_layout or tuple(layout)
                 local_layout = declared_local if declared_local is not None else layout
                 size_bytes = sum(

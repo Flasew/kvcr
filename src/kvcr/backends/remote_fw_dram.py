@@ -81,6 +81,10 @@ class _RequestHint:
     block_hashes: frozenset[int]
     submitted_at: float | None
     evict_on_finish: bool = False
+    no_retain: bool = False
+    no_retain_applied: set[BlockKey] = field(
+        default_factory=set, repr=False, compare=False
+    )
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -139,6 +143,7 @@ class _RemoteFWDram:
         # Main-thread state: request hints, source ownership, and progress state.
         self._closed = False
         self._request_hints: dict[str, _RequestHint] = {}
+        self._no_retain_ops: dict[OpHandle, _RequestHint] = {}
         self._connected_remote_count = 0
         self._sources = _RemoteSources(self, kvcr)
 
@@ -171,6 +176,7 @@ class _RemoteFWDram:
         request_id: str | None,
         *,
         evict_on_finish: bool = False,
+        no_retain: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -204,6 +210,7 @@ class _RemoteFWDram:
                 source=src,
                 block_hashes=block_hashes,
                 evict_on_finish=evict_on_finish,
+                no_retain=no_retain,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -497,6 +504,32 @@ class _RemoteFWDram:
         if not self._closed:
             self._sources.poll()
 
+    def apply_no_retain(
+        self, entries: Mapping[BlockKey, OpEntryResult], op_handle: OpHandle
+    ) -> None:
+        kvcr = self._kvcr
+        hint = self._no_retain_ops.pop(op_handle, None)
+        adapter = kvcr._key_adapter
+        if hint is None or hint.failed or adapter is None or kvcr._local_dram is None:
+            return
+        marked = kvcr._no_retain
+        for key, result in entries.items():
+            if not result.success or key in hint.no_retain_applied:
+                continue
+            try:
+                if adapter.encode_to_router(key) not in hint.block_hashes:
+                    continue
+            except Exception:
+                logger.warning("KVCR no_retain marking failed: %r", key, exc_info=True)
+                continue
+            hint.no_retain_applied.add(key)
+            if hint.no_retain:
+                # Marks outlive requests and cache entries; no size or expiry limit.
+                marked.add(key)
+            elif key in marked:
+                marked.discard(key)
+                logger.info("KVCR cleared no_retain for key %r", key)
+
     def discard_hint(self, request_id: str) -> None:
         hint = self._request_hints.pop(request_id, None)
         if hint is not None and hint.trace is not None:
@@ -517,6 +550,7 @@ class _RemoteFWDram:
             if hint.trace is not None:
                 hint.trace.mark("hint.discarded", once=True, reason=Reason.SHUTDOWN)
         self._request_hints.clear()
+        self._no_retain_ops.clear()
         self._sources.close()
 
     # -------------------------------------------------------------------------

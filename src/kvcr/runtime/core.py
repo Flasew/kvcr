@@ -254,6 +254,7 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
+        self._no_retain: set[BlockKey] = set()
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -644,6 +645,7 @@ class _KVCRCore:
                 pushed = trace.push("op.deliver")
         try:
             with self._state_lock:
+                hint = self._remote_fw_dram._request_hints.get(request_id)
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
@@ -704,6 +706,8 @@ class _KVCRCore:
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
+        if hint is not None and local_dram is not None:
+            self._remote_fw_dram._no_retain_ops[op_handle] = hint
         return op_handle
 
     def deposit(
@@ -801,6 +805,7 @@ class _KVCRCore:
                 )
                 return op_handle
 
+            hint = self._remote_fw_dram._request_hints.get(request_id)
             local_dram._pools._drain_source_completions()
             self._drain_invalidation()
             named_source = (
@@ -860,6 +865,8 @@ class _KVCRCore:
                     evict_on_finish=evict,
                     named_source=named_source,
                 )
+        if hint is not None:
+            self._remote_fw_dram._no_retain_ops[op_handle] = hint
         return op_handle
 
     def release(self, handles: Collection[ReleaseHandle]) -> list[ReleaseResult]:
@@ -889,6 +896,9 @@ class _KVCRCore:
         self._completion_queue = []
         if self._independent_hint_handler._pending_operations:
             completed = self._independent_hint_handler.finish(completed)
+        if self._remote_fw_dram._no_retain_ops:
+            for handle, entries in completed:
+                self._remote_fw_dram.apply_no_retain(entries, handle)
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)
@@ -993,6 +1003,7 @@ class _KVCRCore:
 
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
+        self._no_retain.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
         first_error: BaseException | None = None
