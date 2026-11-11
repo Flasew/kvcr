@@ -135,6 +135,7 @@ class _TargetPullOp(_RemoteOp):
     state: _TargetPullState
     local_fill: bool
     remote_ctrl_ep: str
+    abandon_deadline: float
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     # Keys sent to the source; keys also includes remembered misses.
     ordered_keys: tuple[BlockKey, ...] = ()
@@ -333,10 +334,8 @@ class _TargetPullOp(_RemoteOp):
             # elapsed time alone cannot make its destination safe to reuse.
             return False, backend._dangling_ops.poll_target(progress, self)
 
-        if now >= self.deadline or (
-            cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
-        ):
-            if self.state is _TargetPullState.WAITING_TERMINAL:
+        if self.state is _TargetPullState.WAITING_TERMINAL:
+            if now >= self.abandon_deadline:
                 self.state = _TargetPullState.QUARANTINED
                 if trace is not None:
                     trace.mark(
@@ -349,13 +348,16 @@ class _TargetPullOp(_RemoteOp):
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
+            if not self.probe_sent:
+                # Retry failed enqueues without extending either deadline.
+                self.probe_sent = backend._dangling_ops.probe(progress, self)
+                return False, self.probe_sent
+            return False, False
+
+        if now >= self.deadline or cancelled:
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
                 trace.cancel_requested("target.cancel_requested", cancelled)
-            config = backend._kvcr.config
-            self.deadline += (
-                config.abandon_timeout_ms - config.operation_timeout_ms
-            ) / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
             self.probe_sent = backend._dangling_ops.probe(progress, self)
             if self.local_fill:
@@ -366,10 +368,6 @@ class _TargetPullOp(_RemoteOp):
                     )
                 )
             return False, True
-        if self.state is _TargetPullState.WAITING_TERMINAL and not self.probe_sent:
-            # Retry failed enqueues without extending the grace period.
-            self.probe_sent = backend._dangling_ops.probe(progress, self)
-            return False, self.probe_sent
         return False, False
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -411,6 +409,8 @@ class _SourceWriteOp(_RemoteOp):
     nvtx_state: _NvtxState | None = None
     # Keys this move marked pending at the source; reopened if the write fails.
     moving: tuple[BlockKey, ...] = ()
+    # None means copy; else the keys to evict by layout, set at source preparation.
+    evictions: dict[tuple[str, ...], list[BlockKey]] | None = None
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
 
@@ -567,6 +567,11 @@ class _SourceWriteOp(_RemoteOp):
                 len(self.keys),
                 ("source_write",),
             )
+            if self.evictions is not None:
+                backend._progress_outbound.extend(
+                    _Invalidate(keys=tuple(keys), key_layout=layout)
+                    for layout, keys in self.evictions.items()
+                )
         else:
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
         result = "success" if self.success else "failed"

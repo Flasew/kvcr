@@ -98,6 +98,7 @@ def test_target_terminal_reason_preserves_cause(
         keys=frozenset({key}),
         started_at=0.0,
         deadline=1.0,
+        abandon_deadline=2.0,
         state=_TargetPullState.WAITING_WRITE_DONE
         if prior is _nvtx.Reason.UNKNOWN
         else _TargetPullState.WAITING_TERMINAL,
@@ -391,7 +392,7 @@ def test_cancellation_cause_survives_grace_deadline(recording):
 
 def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     test_kvcr_remote_target.test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
-        "guard"
+        "guard", "kv.fetch"
     )
     [queued] = payloads(recording, "target.queued")
     assert int(queued["op_handle"]) < 0

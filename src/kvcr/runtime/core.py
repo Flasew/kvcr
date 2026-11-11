@@ -509,7 +509,8 @@ class _KVCRCore:
     ) -> list[tuple[QueryStatus, CacheTier | None]]:
         """Return the best available local or remote path for each key.
 
-        Exact hint membership is used unless opportunistic querying is enabled.
+        Remote availability follows the hint's membership rules; ``kv.fetch``
+        may also use opportunistic querying when enabled.
         Usable remote selections persist until successful fetch or discard_hint.
         """
         statuses = []
@@ -831,13 +832,8 @@ class _KVCRCore:
                     key, request_id
                 ):
                     sources[key] = CacheTier.REMOTE_G2
-            deadline = self._operation_deadline()
-            if move:
-                # Accept delayed completion using the existing abandonment budget.
-                # The source independently caps its native transfer timeout.
-                deadline += (
-                    self.config.abandon_timeout_ms - self.config.operation_timeout_ms
-                ) / 1000
+            evict = self._remote_fw_dram.evicts_on_finish(request_id, named_source)
+            deadline = self._operation_deadline(evict)
             destinations = local_dram.fetch(
                 op_handle,
                 ordered_keys,
@@ -846,6 +842,7 @@ class _KVCRCore:
                 deadline,
                 hints=hints,
                 layout=requested,
+                evict_on_finish=evict,
                 key_layout=declaration,
                 named_source=named_source,
             )
@@ -859,6 +856,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    evict_on_finish=evict,
                     named_source=named_source,
                 )
         return op_handle
@@ -1174,6 +1172,7 @@ class _KVCRCore:
         request_id: str | None,
         deadline: float,
         *,
+        evict_on_finish: bool,
         named_source: _NamedSource | None = None,
     ) -> None:
         if not blocks:
@@ -1193,6 +1192,7 @@ class _KVCRCore:
                 request_id,
                 deadline,
                 op_handle=fill_handle,
+                evict_on_finish=evict_on_finish,
                 named_source=named_source,
             )
         else:
@@ -1434,8 +1434,11 @@ class _KVCRCore:
 
     # Timing and telemetry helpers.
 
-    def _operation_deadline(self) -> float:
-        return self._clock() + self.config.operation_timeout_ms / 1000
+    def _operation_deadline(self, evict_on_finish: bool = False) -> float:
+        timeout_ms = self.config.operation_timeout_ms
+        if evict_on_finish:
+            timeout_ms = (timeout_ms + self.config.abandon_timeout_ms) / 2
+        return self._clock() + timeout_ms / 1000
 
     def _record_duration_enabled(
         self, scope: str, started_at: float | None, result: str
