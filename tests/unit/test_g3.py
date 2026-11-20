@@ -696,6 +696,41 @@ def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path) -> None:
     assert not (tmp_path / "g3.data").exists()
 
 
+@pytest.mark.parametrize("drop_g2_first", [True, False])
+@pytest.mark.parametrize("encode_error", [False, True])
+def test_recovered_hash_collisions_track_both_storage_tiers(
+    tmp_path, drop_g2_first, encode_error
+):
+    page = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page)
+    adapter = _ConstantHashAdapter()
+    core = _new_g3_kvcr(tmp_path, local, key_adapter=adapter)._core
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    install_recovery_records(
+        core,
+        {
+            first: _recovered_record(g2=[("", 0)], g3=0),
+            second: _recovered_record(g3=1),
+        },
+    )
+    assert core.resolve_hashes((123,)) == ({}, {123: "ambiguous_hash"})
+    if encode_error:
+        adapter.encode_to_router = Mock(side_effect=RuntimeError("encoding failed"))
+    with core._state_lock:
+        # Hold each reclaimed slot to force the next allocation to evict too.
+        assert core._g3._allocate_slot(frozenset((first,))) == 1
+        assert core.resolve_hashes((123,)) == ({(("",), (page,)): {first: 123}}, {})
+        if drop_g2_first:
+            core._local_dram._pools._drop(first)
+            assert core.resolve_hashes((123,)) == ({}, {123: "source_not_transferable"})
+        assert core._g3._allocate_slot(frozenset()) == 0
+        core._g3._free_slots.extend((0, 1))
+        if not drop_g2_first:
+            assert core.resolve_hashes((123,)) == ({(("",), (page,)): {first: 123}}, {})
+            core._local_dram._pools._drop(first)
+    assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
+
+
 @pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
 def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     tmp_path,

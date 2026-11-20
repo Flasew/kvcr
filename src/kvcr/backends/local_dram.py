@@ -665,7 +665,7 @@ class _LocalDram:
                 and not residency.pending_deposits
             ):
                 with state.lock:
-                    if self._kvcr.framework_control is not None:
+                    if key in state.index:
                         state.index[key] = None
                     residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:

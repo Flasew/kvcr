@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Request advice and independent prefetch/move hint execution."""
 
-import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -47,9 +46,9 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
     return taken
 
 
-class _PrefixAdapter:
+class _TestAdapter:
     def encode_to_router(self, key):
-        return int.from_bytes(key[:8], "big")
+        return {_KEY: 123, _TAIL_KEY: 124}.get(key, int.from_bytes(key[:8], "big"))
 
 
 def _key(block_hash: int) -> BlockKey:
@@ -62,7 +61,7 @@ def _fetch_kvcr(monkeypatch):
         FakePrimaryPinning(),
         FakeBytesControl(),
         KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
-        key_adapter=_PrefixAdapter(),
+        key_adapter=_TestAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False, opportunistic_query=False
         ),
@@ -209,10 +208,7 @@ def _group(**changes):
 def pair(monkeypatch):
     """Two peers with reverse lookup; the source holds _KEY and both record
     hint results: admission at the source, the transfer at the target."""
-    pair = _Pair()
-    pair.source.kvcr._core._key_adapter = SimpleNamespace(
-        decode_from_router={123: _KEY, 124: _TAIL_KEY}.__getitem__
-    )
+    pair = _Pair(key_adapter=_TestAdapter())
     pair.source.deposit(_KEY)
     pair.source_reports, pair.target_reports = (
         _record_hint_results(monkeypatch, peer.kvcr)
@@ -252,9 +248,6 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     source, target = pair.source, pair.target
     source.deposit(_TAIL_KEY, 1)
     marked = target.kvcr._core._no_retain
-    target.kvcr._core._key_adapter = SimpleNamespace(
-        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
-    )
     remote = target.kvcr._core._remote_fw_dram
     remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
     hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
@@ -426,7 +419,7 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     report = pair.target_reports.pop()
     failures = {999: "not_found"}
     if protected or not existing:
-        failures[123] = "protected" if protected else "source_not_transferable"
+        failures[123] = "protected" if protected else "not_found"
     assert report.failures == failures
     assert report.status is (
         HintStatus.FAILED if 123 in failures else HintStatus.COMPLETED
@@ -561,15 +554,7 @@ def test_destination_rejects_unusable_requests(pair, changes, reason, monkeypatc
     _idle(pair)
 
 
-def test_all_failed_resolution_runs_under_the_owner_lock(pair, monkeypatch):
-    source = pair.source.kvcr._core
-    owner = threading.get_ident()
-
-    def decode(block_hash):
-        assert threading.get_ident() == owner and source._state_lock._is_owned()
-        raise KeyError(block_hash)
-
-    monkeypatch.setattr(source._key_adapter, "decode_from_router", decode)
+def test_unresolved_prefetch_is_reported_without_forwarding(pair):
     _submit(pair, "kv.prefetch", hashes=(999,))
     [result] = pair.source_reports
     assert result.status is HintStatus.FAILED and result.failures == {999: "not_found"}

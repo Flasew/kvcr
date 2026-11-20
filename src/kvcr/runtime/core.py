@@ -224,6 +224,9 @@ class _KVCRCore:
         self._cancel_pin_request_callback = bindings.cancel_pin_request
         self.framework_control = bindings.framework_control
         self._key_adapter = bindings.key_adapter
+        self._source_index_enabled = (
+            self.framework_control is not None or self._key_adapter is not None
+        )
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
@@ -252,6 +255,8 @@ class _KVCRCore:
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
+        # G2/G3 identities share the source reader lock; sets hold collisions.
+        self._block_hash_map: dict[int | bytes, BlockKey | set[BlockKey]] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
         self._no_retain: set[int] = set()
@@ -402,6 +407,7 @@ class _KVCRCore:
         local_dram._pools.adopt_recovery_slots(records)
         if g3 is not None:
             g3.adopt_recovery_slots(records)
+        self._update_block_hash_map(records)
 
         # One admission per block: _on_ingest fires only for a single-tier block,
         # so routing through it would skip everything recovered into both.
@@ -441,54 +447,42 @@ class _KVCRCore:
         dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]],
         dict[int, str],
     ]:
-        """Resolve advisory identities under the owner lock; the later transfer
-        claims source memory. Returns the transferable blocks grouped by
+        """Snapshot advisory identities under the source reader lock; the later
+        transfer claims source memory. Returns transferable blocks grouped by
         (layout, piece sizes) as key -> hash, and the reason each other hash failed."""
-        adapter = self._key_adapter
-        if adapter is None:
+        if self._key_adapter is None:
             return {}, dict.fromkeys(hashes, "key_adapter_unavailable")
-        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
+        if self._local_dram is None:
+            return {}, dict.fromkeys(hashes, "source_not_transferable")
+        state = self._local_dram._pools._source_state
         failures: dict[int, str] = {}
+        snapshots = []
+        pending = iter(hashes)
+        # Bounded holds; the snapshot is advisory.
+        while chunk := tuple(islice(pending, 4096)):
+            with state.lock:
+                for block_hash in chunk:
+                    entry = self._block_hash_map.get(block_hash)
+                    if entry is None:
+                        failures[block_hash] = "not_found"
+                    elif isinstance(entry, set):
+                        failures[block_hash] = "ambiguous_hash"
+                    else:
+                        key = entry
+                        local = state.index.get(key)
+                        if local is None:
+                            failures[block_hash] = "source_not_transferable"
+                        else:
+                            snapshots.append((block_hash, key, local.key_layout))
+        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
         sizes_by_layout: dict[tuple[str, ...], tuple[int, ...]] = {}
-        lookup_failed = False
-        for block_hash in hashes:
-            try:
-                key = adapter.decode_from_router(block_hash)
-            except KeyError:
-                failures[block_hash] = "not_found"
-                continue
-            except ValueError:
-                failures[block_hash] = "ambiguous_hash"
-                continue
-            except Exception:
-                # An adapter error fails this hash, not the whole request.
-                if not lookup_failed:
-                    lookup_failed = True
-                    logger.warning("Hash metadata lookup failed", exc_info=True)
-                failures[block_hash] = "resolution_failed"
-                continue
-            record = self._block_record_map.get(key)
-            local = record.local_dram if record is not None else None
-            layout = local.key_layout if local is not None else None
-            if (
-                local is None
-                or record.pending_invalidation
-                or local.state is not _LocalDramState.READY
-                or local.pending_labels
-                or not layout
-            ):
-                failures[block_hash] = "source_not_transferable"
-                continue
+        for block_hash, key, layout in snapshots:
             sizes = sizes_by_layout.get(layout)
             if sizes is None:
                 sizes = sizes_by_layout[layout] = tuple(
                     self._block_sizes[label.partition(":")[0]] for label in layout
                 )
-            resolved = groups.setdefault((layout, sizes), {})
-            if key in resolved and resolved[key] != block_hash:
-                failures[block_hash] = "resolution_failed"
-            else:
-                resolved[key] = block_hash
+            groups.setdefault((layout, sizes), {})[key] = block_hash
         return groups, failures
 
     def _has_complete_local(self, key: BlockKey) -> bool:
@@ -1061,6 +1055,65 @@ class _KVCRCore:
                     hint.failed if hint is not None else None,
                 )
 
+    def _update_block_hash_map(self, keys: Iterable[BlockKey]) -> None:
+        """Encode core-locked residency; update the map under the reader lock."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return
+        encoded = []
+        unencoded_removals: set[BlockKey] | None = None
+        for key in keys:
+            record = self._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            # Invalidating/retiring copies retain identity until actually removed.
+            resident = record is not None and (
+                record.g3 is not None
+                or local is not None
+                and local.state is _LocalDramState.READY
+                and not local.pending_labels
+            )
+            try:
+                block_hash = adapter.encode_to_router(key)
+                if not isinstance(block_hash, (int, bytes)):
+                    raise TypeError("block hashes must be int or bytes")
+            except Exception:
+                if unencoded_removals is None:
+                    unencoded_removals = set()
+                    logger.warning(
+                        "KVCR block hash encoding failed for %r", key, exc_info=True
+                    )
+                if not resident:
+                    unencoded_removals.add(key)
+                continue
+            encoded.append((block_hash, key, resident))
+        with self._local_dram._pools._source_state.lock:
+            block_hash_map = self._block_hash_map
+            if unencoded_removals:
+                # Find the previous hashes in one scan for the entire failed batch.
+                for block_hash, entry in block_hash_map.items():
+                    if isinstance(entry, set):
+                        encoded.extend(
+                            (block_hash, key, False)
+                            for key in entry & unencoded_removals
+                        )
+                    elif entry in unencoded_removals:
+                        encoded.append((block_hash, entry, False))
+            for block_hash, key, resident in encoded:
+                entry = block_hash_map.get(block_hash)
+                if isinstance(entry, set):
+                    if resident:
+                        entry.add(key)
+                    else:
+                        entry.discard(key)
+                    if len(entry) == 1:
+                        block_hash_map[block_hash] = next(iter(entry))
+                elif resident:
+                    block_hash_map[block_hash] = (
+                        key if entry is None or entry == key else {entry, key}
+                    )
+                elif entry == key:
+                    del block_hash_map[block_hash]
+
     def _publish_inventory(
         self,
         keys: Collection[BlockKey],
@@ -1071,6 +1124,7 @@ class _KVCRCore:
         if not keys:
             return True
         event = InventoryEvent(tuple(keys), tier, removed)
+        self._update_block_hash_map(event.keys)
         callback = self._inventory_sink_callback
         kind = "removed" if removed else "stored"
         if callback is None:

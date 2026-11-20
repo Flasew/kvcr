@@ -279,7 +279,7 @@ Each hint in an envelope is parsed and handled independently. `discard_hint` nor
 
 During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
-The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
+KVCR core maintains the hash-to-key map from inventory changes and recovered residency via the configured adapter's `encode_to_router()`. Resolution uses the source reader lock and no longer calls `decode_from_router()`; the adapter API is unchanged. Missing or ambiguous hashes fail individually while valid hashes proceed. Only complete KVCR-owned DRAM copies are transferable; lookup reserves nothing, so blocks may disappear before transfer. Guard takeover does not automatically preserve the adapter.
 
 `kv.no_retain` acts on the receiving KVCR immediately: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
 

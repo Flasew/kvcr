@@ -2009,7 +2009,7 @@ def _unserved_counts(records) -> dict[tuple[str, ...], int]:
 
 
 class _Peer:
-    def __init__(self, name):
+    def __init__(self, name, *, key_adapter=None):
         self.name = name
         self.primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
         self.local = ctypes.create_string_buffer(32)
@@ -2021,6 +2021,7 @@ class _Peer:
             FakePrimaryPinning(),
             self.control,
             name=name,
+            key_adapter=key_adapter,
             framework_regions=[
                 _buffer_region(self.primary, 16),
                 _buffer_region(self.primary, 16, ":*"),
@@ -2045,8 +2046,9 @@ class _Peer:
 class _Pair:
     """Use real buffers; forward control and completed fake-native notifications."""
 
-    def __init__(self):
-        self.source, self.target = _Peer("source"), _Peer("target")
+    def __init__(self, *, key_adapter=None):
+        self.source = _Peer("source", key_adapter=key_adapter)
+        self.target = _Peer("target", key_adapter=key_adapter)
         self.offsets = [[0, 0], [0, 0]]
         self.delivered = set()
 
@@ -2243,12 +2245,14 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     source = pair.source
     kvcr = source.kvcr
     key = BlockKey(b"reader")
-    source.deposit(key)
     other = BlockKey(b"other")
+    kvcr._core._key_adapter = SimpleNamespace(
+        encode_to_router={key: 123, other: 124}.__getitem__
+    )
+    source.deposit(key)
     source.deposit(other, 1)
     fetched = kvcr.fetch((key,))
     claim = dict(kvcr.poll_completed())[fetched][key].release_handle
-    kvcr._core._key_adapter = SimpleNamespace(decode_from_router={123: key}.__getitem__)
     kvcr.submit_hint(_router_hint(None, (123, 123), action_type="kv.invalidate"))
     assert kvcr.query((key,)) == [(QueryStatus.MISS, None)]
     handles = [

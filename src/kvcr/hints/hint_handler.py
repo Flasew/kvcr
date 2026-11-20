@@ -38,6 +38,10 @@ class _HintHandler(ABC):
     admission once. Handlers acquire the lock as needed for cache operations.
     """
 
+    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
+        self._core = core
+        self._dispatcher = dispatcher
+
     @abstractmethod
     def submit(
         self,
@@ -52,10 +56,6 @@ class _HintHandler(ABC):
 
 class _FetchHintHandler(_HintHandler):
     """Store request advice and apply any retention setting immediately."""
-
-    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
-        self._core = core  # backend access only
-        self._dispatcher = dispatcher  # results
 
     def submit(
         self,
@@ -86,10 +86,6 @@ class _FetchHintHandler(_HintHandler):
 
 class _NoRetainHintHandler(_HintHandler):
     """Set or clear retention advice on the receiving KVCR."""
-
-    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
-        self._core = core
-        self._dispatcher = dispatcher
 
     def submit(
         self,
@@ -179,8 +175,6 @@ class _IndependentHintHandler(_HintHandler):
             groups, failures = core.resolve_hashes(hint.block_hashes)
             status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
             if isinstance(hint, _KVInvalidateHint):
-                # A resolved key without a complete READY copy, including one
-                # still filling, fails resolution as source_not_transferable.
                 by_key = {k: h for g in groups.values() for k, h in g.items()}
                 queued = set(core._invalidation_handler.submit(by_key))
                 for key, block_hash in by_key.items():
