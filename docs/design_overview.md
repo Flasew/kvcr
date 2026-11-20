@@ -257,7 +257,7 @@ KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_
 
 ### KV transfer hints
 
-For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` marks the advertised hashes so later deposits of those blocks are dropped, except when filling an existing partial copy.
+For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. With a key adapter configured, the destination drops later unprotected deposits of marked blocks, except when filling an existing partial copy.
 
 The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
@@ -279,7 +279,7 @@ Each hint in an envelope is parsed and handled independently. `discard_hint` nor
 
 During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
-The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
+KVCR indexes resident keys by block hash from its adapter, a peer, or Guard recovery. An unidentified resident makes lookup unsafe. A unique match must have a complete, readable KVCR DRAM copy. The transfer claims it later.
 
 `kv.no_retain` acts on the receiving KVCR immediately: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
 

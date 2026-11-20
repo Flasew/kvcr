@@ -18,14 +18,17 @@ from _kvcr_test_utils import (
     FakeTelemetryStats,
     PendingPrimaryPinning,
     _buffer_region,
+    _ConstantHashAdapter,
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
     _poll_until,
     _recovered_record,
+    _router_hint,
     _start_write_message,
     _wait_until,
 )
@@ -47,6 +50,8 @@ from kvcr.runtime.progress import _STOP, _TransferRef, _wait_for_wake
 from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
+    CacheTier,
+    InventoryEvent,
     OpEntryResult,
     OpEntryStatus,
     PinHandle,
@@ -55,55 +60,38 @@ from kvcr.types import (
 )
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["ready", "ambiguous", "stale", "adapter_error", "incomplete", "duplicate_key"],
-)
-def test_resolve_hashes_reports_each_hash_without_pinning_or_copying(case):
-    """Resolution needs only inventory and an adapter, with no transfer/pin APIs."""
-    key = BlockKey(b"full-key-with-group")
-    adapter = SimpleNamespace()
-    adapter.decode_from_router = Mock(
-        side_effect=[
-            {
-                "ambiguous": ValueError("collision"),
-                "adapter_error": RuntimeError("bug"),
-            }.get(case, key),
-            KeyError(999),
-        ]
+@pytest.mark.parametrize("second", [123, [], RuntimeError("encoding failed")])
+def test_hash_resolution_at_inventory_publication(second):
+    a, b = BlockKey(b"A"), BlockKey(b"B")
+    tier = CacheTier.LOCAL_G2
+    observations = []
+    encoder = Mock(side_effect=[123, second, 123])
+    adapter = SimpleNamespace(encode_to_router=encoder)
+
+    def observe(event):
+        observations.append((event, core.resolve_hashes((123,))))
+        if second == 123:
+            raise RuntimeError("inventory unavailable")
+
+    kvcr, agent, _, _memory = _pinless_source(
+        32, key_adapter=adapter, inventory_sink=observe
     )
-    residency = _LocalDramResidency(
-        (("", 0), (":tail", 1)) if case == "incomplete" else (("", 0),),
-        _LocalDramState.READY,
-        pending_labels={":tail"} if case == "incomplete" else None,
-    )
-    core = SimpleNamespace(
-        _key_adapter=adapter,
-        _block_sizes={"": 16},
-        _block_record_map={}
-        if case == "stale"
-        else {key: _BlockRecord(local_dram=residency)},
-    )
-    hashes = (123, 999)
-    if case == "duplicate_key":
-        adapter.decode_from_router.side_effect = [key, key, KeyError(999)]
-        hashes = (123, 124, 999)
-    groups, failures = _KVCRCore.resolve_hashes(core, hashes)
-    assert failures.pop(999) == "not_found"
-    if case in ("ready", "duplicate_key"):
-        assert groups == {(("",), (16,)): {key: 123}}
-        assert failures == (
-            {124: "resolution_failed"} if case == "duplicate_key" else {}
-        )
-    else:
-        assert not groups and failures == {
-            123: {
-                "ambiguous": "ambiguous_hash",
-                "stale": "source_not_transferable",
-                "incomplete": "source_not_transferable",
-                "adapter_error": "resolution_failed",
-            }[case]
-        }
+    core = kvcr._core
+    agent.state = "DONE"
+    ref = _mem_descriptor(end_point_name="source")
+    handle = kvcr.deposit({a: [ref], b: [ref]})
+    entries = dict(_poll_until(kvcr, bool))[handle]
+    assert entries[a].success and entries[b].success
+    ambiguous = ({}, {123: "ambiguous_hash"})
+    assert observations == [(InventoryEvent((a, b), tier, False), ambiguous)]
+    kvcr.submit_hint(_router_hint(None, (123,), action_type="kv.invalidate"))
+    kvcr.poll_completed()
+    assert core.resolve_hashes((123,)) == ambiguous
+    assert encoder.call_count == (2 if second == 123 else 3)
+    _invalidate(kvcr, (b,))
+    _poll_until(kvcr, lambda _: b not in core._block_record_map)
+    unique = ({(("",), (16,)): {a: 123}}, {})
+    assert observations[1:] == [(InventoryEvent((b,), tier, True), unique)]
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
@@ -408,6 +396,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
             capacity_low_watermark_percent=100,
         ),
         name="source",
+        key_adapter=_ConstantHashAdapter(),
         framework_regions=[
             RegionDescriptor(
                 addr=ctypes.addressof(memory), size=16, count=3, label=label
@@ -444,6 +433,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
                 expected_layout=["", ":b", ":c"],
             )
             assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+            assert source._core.resolve_hashes((123,)) == ({}, {123: "not_found"})
         prior_transfers = len(agent.xfers)
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
@@ -490,6 +480,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
             deposit = source.deposit({key: descriptors[1:2]})
             assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
             prior_transfers = len(agent.xfers)
+        assert source._core.resolve_hashes((123,)) == (
+            {(("", ":b", ":c"), (16, 16, 16)): {key: 123}},
+            {},
+        )
         callbacks.clear()
         agent.state = transfer_state
         with (

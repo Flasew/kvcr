@@ -12,11 +12,18 @@ from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
-from _kvcr_test_utils import _recovered_record
+from _kvcr_test_utils import (
+    _ConstantHashAdapter,
+    _invalidate,
+    _recovered_record,
+    _router_hint,
+)
+from test_kvcr_remote_target import _Peer
 
 from kvcr.backends.local_disk import _G3, _G3Residency
 from kvcr.runtime.core import _BlockRecord
 from kvcr.runtime.progress import _TransferRef
+from kvcr.service.guard import _RecoveryState
 from kvcr.service.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.service.protocol import _PoolDescriptor
 from kvcr.service.recovery_journal import (
@@ -33,6 +40,7 @@ from kvcr.service.recovery_journal import (
     _project_recovery_record,
     _recovery_frames,
     _RecoveryMirror,
+    adopt_claimed_pool,
     canonical_pool_terms,
     read_handback,
     read_recovery_snapshot,
@@ -75,6 +83,40 @@ def journal_and_mapping(
         yield journal, mapping
     finally:
         mapping.close()
+
+
+def test_cold_guard_reports_an_unknown_hash():
+    core = _Peer("guard").kvcr._core
+    core.adopt_recovery_records({}, retained_g3={})
+    assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
+
+
+def test_live_hash_retry_waits_for_ring_space_without_invalidating(journal_and_mapping):
+    journal, _ = journal_and_mapping
+    adapter = Mock()
+    adapter.encode_to_router.side_effect = ValueError
+    peer = _Peer("source", key_adapter=adapter)
+    core = peer.kvcr._core
+    claimed = Mock(hold=Mock(_incarnation=None, _attachment=journal._pool))
+    claimed.recovered.take_records.return_value = {}
+    adopt_claimed_pool(core, claimed)
+    keys = [byte * (journal._capacity // 2) for byte in (b"a", b"b")]
+    for i, key in enumerate(keys):
+        peer.deposit(key, i)
+        assert journal.read_next()[1] == key
+
+    adapter.encode_to_router.side_effect = lambda _: 123
+    for _ in range(2):
+        assert core.resolve_hashes((123,)) == ({}, {123: "resolution_failed"})
+    first = journal.read_next()
+    assert first[1] == keys[0] and journal.read_next() is None
+    assert core.resolve_hashes((123,)) == ({}, {123: "ambiguous_hash"})
+    second = journal.read_next()
+    assert second[1] == keys[1] and journal.read_next() is None
+    for _, _, payload in (first, second):
+        record = _decode_recovery_record(payload, ("",))
+        assert record.complete_dram and record.block_hash == 123
+    peer.kvcr.close()
 
 
 def test_ring_round_trips_wraps_and_drains_streaming(
@@ -193,7 +235,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     journal, _ = journal_and_mapping
     local_dram, g3 = _Source(), _Source()
     key = BlockKey(b"block")
-    _attach_journal(local_dram, journal, g3)
+    try_publish_hash = _attach_journal(local_dram, journal, g3)
     caplog.set_level("WARNING", logger="kvcr.service.recovery_journal")
 
     local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
@@ -211,6 +253,14 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         _BlockRecord(),
     ]
     assert caplog.messages == []
+    oversized = _recovered_record(g3=7)
+    oversized.block_hash = bytes(_MAX_FRAME_SIZE)
+    for publish in (g3.emit, try_publish_hash):
+        publish(key, oversized)
+        payload = journal.read_next()[2]
+        assert _decode_recovery_record(payload, ("pool0",)) == _BlockRecord()
+    assert try_publish_hash(BlockKey(bytes(journal._capacity)), oversized)
+    assert journal.read_next() is None
 
     # One refused attempt, then publication stays off with one warning: the
     # count is the contract, not the wording.
@@ -341,6 +391,67 @@ def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -
         {BlockKey(key * 32): _recovered_record(g2=[("pool0", slot)])},
     )
     write_recovery_snapshot(pool, terms, frames)
+
+
+def test_hashes_follow_journal_replay_guard_invalidation_and_handback(tmp_path):
+    primary = _Peer("source", key_adapter=_ConstantHashAdapter()).kvcr
+    guard = _Peer("guard").kvcr
+    core = guard._core
+    with _attached(tmp_path) as pool:
+        recovery = _RecoveryState(pool._spec, _TEST_DIGEST, (32,))
+        recovery.attachment = pool
+        recovery.configure([("", 16)])
+        recovery._journal = RecoveryJournal(pool)
+        recovery.start_primary()
+        # A full ring must drain before publishing the legacy row's new hash.
+        padding = bytes(recovery._journal._capacity - 8)
+        assert RecoveryJournal(pool).publish(_RECORD_BLOCK, padding, b"\x90")
+        claimed = Mock(hold=Mock(_incarnation=None, _attachment=pool))
+        claimed.recovered.take_records.return_value = {
+            b"legacy": _recovered_record(g2=[("", 1)])
+        }
+        with patch("kvcr.service.recovery_journal.time") as clock:
+            clock.monotonic.side_effect = (0, 0)
+            clock.sleep.side_effect = lambda _: recovery.poll()
+            adopt_claimed_pool(primary._core, claimed)
+        clock.sleep.assert_called_once()
+        primary.close()
+
+        disk = _BlockRecord(g3=_G3Residency(("",), (1,)), block_hash=123)
+        dual = _recovered_record(g2=[("", 0)], g3=2)
+        dual.block_hash = 0
+        writer = RecoveryJournal(pool)
+        for frame in _recovery_frames({b"disk": disk, b"dual": dual}):
+            assert writer.publish(*frame)
+        recovery.prepare_to_serve(core, recovery.take_for_promotion())
+        assert core.resolve_hashes((0, 123)) == (
+            {(("",), (16,)): {b"dual": 0}},
+            {123: "ambiguous_hash"},
+        )
+        _invalidate(guard, (b"legacy",))
+        guard.submit_hint(_router_hint(None, (0,), action_type="kv.invalidate"))
+        guard.poll_completed()
+        assert core.resolve_hashes((0, 123)) == (
+            {},
+            dict.fromkeys((0, 123), "source_not_transferable"),
+        )
+        core.close()
+        recovery.hand_back(core._block_record_map)
+        assert read_handback(pool, _TEST_DIGEST, recovery.pools).take_records() == {
+            b"dual": _BlockRecord(g3=_G3Residency(("",), (2,)), block_hash=0),
+            b"disk": disk,
+        }
+
+        # A maximum-size legacy row fits until a peer supplies its uint64 hash.
+        row = _recovered_record(g2=[("", 0)])
+        legacy = msgspec.msgpack.encode([row.local_dram.slots, None, -1])
+        key = b"k" * (_MAX_FRAME_SIZE - _FRAME_HEADER.size - len(legacy))
+        for block_hash in (None, (1 << 64) - 1):
+            row.block_hash = block_hash
+            recovery.hand_back({key: row, b"disk": disk})
+            saved = read_handback(pool, _TEST_DIGEST, recovery.pools).take_records()
+            assert saved == recovery.mirror._records
+            assert set(saved) == ({key, b"disk"} if block_hash is None else {b"disk"})
 
 
 @pytest.mark.parametrize(

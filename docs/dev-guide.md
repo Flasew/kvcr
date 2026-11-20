@@ -160,7 +160,7 @@ For `on_resilience_event` and optional framework-memory quarantine, see the [res
 
 See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
-For `kv.prefetch` and `kv.move`, configure the key adapter's reverse lookup at the source and keep polling both peers. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
+For `kv.prefetch` and `kv.move`, keep polling both peers. The source can resolve hashes supplied by its adapter, learned from a peer, or restored by Guard. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
 
 ### Development loop
 
@@ -281,7 +281,7 @@ Both are off by default and uncapped in volume. Fingerprints are unsalted and re
 Recovered blocks have no claims or old access timestamps and enter the eviction list. Reuse gives them a new timestamp under the configured policy. Recovery covers new requests; in-flight operations need caller-level retries. The promoted Guard answers stale requests, even when it has no data to serve.
 
 - Any Guard failure stops the service.
-- Journal overflow disables warm recovery for that group. Watch for `KVCR pool recovery disabled`. The primary stops publishing and the Guard drops its mirrored state; the service continues. The journal is fixed at 100 MiB, so larger blocks, shorter pool names, or fewer pool locations per key can reduce pressure.
+- A recovery record over 65,535 bytes leaves that block cold. If a required residency update cannot fit in the 100 MiB journal, Guard drops the group's mirror. Watch for `KVCR pool recovery disabled`. Startup hash backfill waits up to the startup timeout for space. Live hash repairs retry on a later lookup.
 - Currently, Guards do not serve G3. A replacement primary reopens it, but inherited G3 records are not verified against the files, which remain unlocked while the Guard serves. Sharing G3 paths is unsupported and undetected. Missing files are recreated with zeros, so deleting them can silently produce zero-filled cache hits. To discard a disk cache, restart the service.
 
 Service shutdown closes and removes its pool files. Startup reclaims files orphaned by a crashed service; file locks protect pools still used by a live service or attached worker.

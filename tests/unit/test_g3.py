@@ -972,9 +972,11 @@ def test_waiting_g3_fetch_source_is_not_evicted(tmp_path) -> None:
         BlockKey(b"third"),
         BlockKey(b"fourth"),
     )
+    hashes = {first: 123, second: 123, third: 124}
     kvcr = _new_g3_kvcr(
         tmp_path,
         local,
+        key_adapter=Mock(encode_to_router=lambda key: hashes.get(key, 125)),
         slot_count=2,
         framework_regions=[_buffer_region(primary, page_size)],
     )
@@ -986,11 +988,24 @@ def test_waiting_g3_fetch_source_is_not_evicted(tmp_path) -> None:
         (QueryStatus.FETCHABLE, CacheTier.G3),
     ]
 
+    assert kvcr._core.resolve_hashes((123, 124)) == (
+        {(("",), (page_size,)): {third: 124}},
+        {123: "ambiguous_hash"},
+    )
+
     fetch = kvcr.fetch((first,))
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert result[fetch][first].success
     assert kvcr.query((first,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert kvcr.query((second,)) == [(QueryStatus.MISS, None)]
+    # The fetch holds first in G2 while further spills evict its G3 copy.
+    for i in range(3):
+        assert _deposit(kvcr, f"fresh-{i}".encode(), i).success
+    assert kvcr._core._block_record_map[first].g3 is None
+    assert kvcr._core.resolve_hashes((123, 124)) == (
+        {(("",), (page_size,)): {first: 123}},
+        {124: "not_found"},
+    )
 
 
 def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:

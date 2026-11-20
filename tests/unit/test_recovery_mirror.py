@@ -74,10 +74,10 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
         ),
         (
-            replace(_recovered_record(g3=5), position=6),
+            replace(_recovered_record(g3=5), position=6, block_hash=b"advertised"),
             _ONE_POOL,
-            [None, [[""], [5]], 6],
-            replace(_recovered_record(g3=5), position=6),
+            [None, [[""], [5]], 6, b"advertised"],
+            replace(_recovered_record(g3=5), position=6, block_hash=b"advertised"),
         ),
         (
             _BlockRecord(
@@ -102,7 +102,8 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         ),
         (
             _BlockRecord(
-                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING)
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING),
+                block_hash=b"dropped",
             ),
             _ONE_POOL,
             [None, None, -1],
@@ -147,6 +148,8 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     with pytest.raises(msgspec.ValidationError):
         _decode_recovery_record(legacy, _ONE_POOL)
     positioned = replace(_recovered_record(g2=[("", 3)], g3=5), position=6)
+    old = msgspec.msgpack.encode([[["", 3]], [[""], [5]], 6])
+    assert _decode_recovery_record(old, _ONE_POOL) == positioned
     today = _payload(positioned)
 
     upgraded = msgspec.msgpack.Decoder(_RecoveryBlockV2).decode(today)
@@ -154,7 +157,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     assert upgraded.g3 == (("",), (5,))
     assert upgraded.position == 6
     assert upgraded.appended == 0
-    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], (("",), (5,)), 6, 42))
+    future = msgspec.msgpack.encode(replace(upgraded, appended=42))
     assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 

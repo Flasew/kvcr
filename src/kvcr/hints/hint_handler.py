@@ -38,6 +38,10 @@ class _HintHandler(ABC):
     admission once. Handlers acquire the lock as needed for cache operations.
     """
 
+    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
+        self._core = core
+        self._dispatcher = dispatcher
+
     @abstractmethod
     def submit(
         self,
@@ -52,10 +56,6 @@ class _HintHandler(ABC):
 
 class _FetchHintHandler(_HintHandler):
     """Store request advice and apply any retention setting immediately."""
-
-    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
-        self._core = core  # backend access only
-        self._dispatcher = dispatcher  # results
 
     def submit(
         self,
@@ -86,10 +86,6 @@ class _FetchHintHandler(_HintHandler):
 
 class _NoRetainHintHandler(_HintHandler):
     """Set or clear retention advice on the receiving KVCR."""
-
-    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
-        self._core = core
-        self._dispatcher = dispatcher
 
     def submit(
         self,
@@ -165,8 +161,8 @@ class _IndependentHintHandler(_HintHandler):
         core = self._core
         if core._local_dram is None:
             reason = "source_has_no_managed_dram"
-        elif core._key_adapter is None:
-            reason = "key_adapter_unavailable"
+        elif core._block_hash_map is None:
+            reason = "block_hash_map_unavailable"
         elif isinstance(hint, _KVPrefetchHint) and hint.destination_endpoint == getattr(
             core.framework_control, "endpoint", None
         ):
@@ -184,8 +180,6 @@ class _IndependentHintHandler(_HintHandler):
             groups, failures = core.resolve_hashes(hint.block_hashes)
             status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
             if isinstance(hint, _KVInvalidateHint):
-                # A resolved key without a complete READY copy, including one
-                # still filling, fails resolution as source_not_transferable.
                 by_key = {k: h for g in groups.values() for k, h in g.items()}
                 queued = set(core._invalidation_handler.submit(by_key))
                 for key, block_hash in by_key.items():
@@ -267,6 +261,7 @@ class _IndependentHintHandler(_HintHandler):
             )
             or len(set(keys)) != len(keys)
             or len(set(hashes)) != len(hashes)
+            or any(not 0 <= h < 1 << 64 for h in hashes)
         ):
             reason = "invalid_request"
         else:
@@ -284,15 +279,16 @@ class _IndependentHintHandler(_HintHandler):
 
         pending = _PendingHint(receipt, len(request.groups))
         for group in request.groups:
-            operation = pending, dict(zip(group.keys, group.block_hashes))
+            source_hashes = dict(zip(group.keys, group.block_hashes))
             if self._layout_sizes(group.key_layout) != group.sizes:
-                self._complete(*operation, {}, reason="incompatible_layout")
+                self._complete(pending, source_hashes, {}, reason="incompatible_layout")
                 continue
             try:
                 handle = core.fetch(
                     group.keys,
                     expected_layout=list(group.key_layout),
                     source_endpoint=source,
+                    source_hashes=source_hashes,
                     move=request.move,
                 )
             except Exception as error:
@@ -304,11 +300,11 @@ class _IndependentHintHandler(_HintHandler):
                     core._hints_dispatcher.warn_handler_error(
                         receipt.action_type, "admission"
                     )
-                self._complete(*operation, {})
+                self._complete(pending, source_hashes, {})
             else:
                 # Synchronous hits are queued until polling, so registration
                 # after fetch returns is safe.
-                self._pending_operations[handle] = operation
+                self._pending_operations[handle] = pending, source_hashes
 
     def _layout_sizes(self, layout: tuple[str, ...]) -> tuple[int, ...] | None:
         """Return piece sizes for a layout this destination can store."""

@@ -342,7 +342,8 @@ def test_startup_timeout_retains_nonquiescent_resources(
     # Either path may build it: a plain core in api, a claimed one in recovery.
     monkeypatch.setattr(kvcr_api, "_KVCRCore", create_core)
     monkeypatch.setattr(kvcr_recovery, "_KVCRCore", create_core)
-    monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
+    journal = Mock(_capacity=4096)
+    monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", lambda _: journal)
     monkeypatch.setattr(kvcr_api, "_NONQUIESCENT_STARTUP_RESOURCES", retained)
     monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(kvcr_progress, "_JOIN_TIMEOUT_SECONDS", 0)
