@@ -1395,18 +1395,34 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_sou
         source.close()
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
+@pytest.mark.parametrize(
+    "mixed,g2_only,shutdown",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
+    mixed, g2_only, shutdown
+):
     now = 0.0
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
+
+    def on_resilience_event(error):
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.claim_count + residency.source_readers == 1
+        errors.append(error)
+
     source = _new_kvcr(
         agent,
         FakePrimaryPinning(missing_indices=(0,)),
         control,
         name="source",
-        on_resilience_event=errors.append,
+        on_resilience_event=on_resilience_event,
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
     )
@@ -1427,6 +1443,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
             _start_write_message(12, key, target_agent="target")
         )
         payload["keys"] = [key, missing, framework_hit] if mixed else [key]
+        payload["g2_only"] = g2_only
         payload["dst_descriptors"] = [
             [_TransferRef("target", index)] for index in range(len(payload["keys"]))
         ]
@@ -1442,18 +1459,36 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
         ]
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count + residency.source_readers == 1
+        if shutdown:
+            source._core._progress._submissions.put(_STOP)
+            _wait_until(lambda: source._core._progress._startup_stage == "cleanup")
         agent.state = "DONE"
-        assert _poll_until(source, lambda _: len(errors) == 2) == []
+        if shutdown:
+            source.close()
+        else:
+            _wait_until(lambda: not source._core._progress._in_flight_ops)
+            control.incoming.append(msgspec.msgpack.encode({
+                "type": "target_metadata_ack", "sender_control_endpoint": "tcp://ack:1",
+            }))  # fmt: skip
+            _wait_until(
+                lambda: (
+                    "tcp://ack:1"
+                    in source._core._remote_fw_dram._metadata_acked_sources
+                )
+            )
+            assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert residency.claim_count + residency.source_readers == 0
+        assert not _has_outstanding_operations(source)
         assert errors[1].source_blocks == expected_sources
         for error in errors:
             assert error.source_owners == expected_owners
             assert error.destination_regions is error.destination_owner is None
-        deposit = source.deposit({replacement: [descriptor]})
-        assert _poll_until(source, bool) == [
-            (deposit, _op_entries({replacement: True}))
-        ]
+        if not shutdown:
+            deposit = source.deposit({replacement: [descriptor]})
+            assert _poll_until(source, bool) == [
+                (deposit, _op_entries({replacement: True}))
+            ]
     finally:
         agent.state = "DONE"
         source.close()

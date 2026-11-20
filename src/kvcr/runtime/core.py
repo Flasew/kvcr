@@ -10,7 +10,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from itertools import islice
+from itertools import count, islice
 from math import ceil, gcd
 from typing import TYPE_CHECKING
 
@@ -73,6 +73,8 @@ TRANSFER_BYTES_METRIC = "kvcr_transfer_bytes"
 TRANSFER_BLOCKS_METRIC = "kvcr_transfer_blocks"
 UNSERVED_BLOCKS_METRIC = "kvcr_unserved_blocks"
 STATE_METRIC = "kvcr_state"
+
+_REMOTE_FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
 
 _Timer = Callable[[], float | None]
 _Clock = Callable[[], float]
@@ -271,13 +273,15 @@ class _KVCRCore:
         self._completion_queue: list[OpResult] = []
         self._resilience_errors: deque[Exception] = deque()
         self._pending_progress_items: list[object] = []
+        self._background_error: Exception | None = None
         self._joined_completions: dict[
             OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
         ] = {}
         # Both seeded from the clock rather than a constant, so a refusal sent before a
         # restart cannot complete a different operation that reused the number.
         handle_seed = time.monotonic_ns()
-        self._next_op_handle: OpHandle = OpHandle(handle_seed)
+        # CPython advances integer count atomically across caller/progress threads.
+        self._op_handles = count(handle_seed)
         self._next_fill_handle: OpHandle = OpHandle(-handle_seed)
 
         # Operational clock and optional telemetry clock.
@@ -371,6 +375,7 @@ class _KVCRCore:
             self._remote_fw_dram.poll_progress,
             self._remote_fw_dram.flush_progress,
             close_progress,
+            consume_completed=self._independent_hint_handler.poll,
             nixl_agent_name=self.nixl_agent_name,
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
@@ -438,8 +443,9 @@ class _KVCRCore:
         self._hints_dispatcher.submit(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
-        self._remote_delivery_keys.pop(request_id, None)
-        self._remote_fw_dram.discard_hint(request_id)
+        with self._state_lock:
+            self._remote_delivery_keys.pop(request_id, None)
+            self._remote_fw_dram.discard_hint(request_id)
 
     def resolve_hashes(
         self, hashes: Collection[int]
@@ -508,51 +514,70 @@ class _KVCRCore:
         Remote availability follows the hint's membership rules; ``kv.fetch``
         may also use opportunistic querying when enabled.
         Usable remote selections persist until successful fetch or discard_hint.
+        Residency is advisory; fetch/deliver revalidate it before claiming storage.
         """
-        statuses = []
-        remote_keys = self._remote_delivery_keys.get(request_id, ())
-        for key in keys:
-            record = self._block_record_map.get(key)
-            if record is not None and record.pending_invalidation:
-                statuses.append((QueryStatus.MISS, None))
-                continue
-            residency = record.local_dram if record is not None else None
-            if key in remote_keys:
-                fetching_locally = (
-                    residency is not None
-                    and residency.state is _LocalDramState.FILLING
-                    and any(
-                        op_id[0] == "fetch"
-                        and (op := self._local_dram._pending_residency_ops.get(op_id))
-                        is not None
-                        and op.request_id == request_id
-                        and key not in op.results
-                        for op_id in record.active_op_ids
-                    )
+        statuses: list[tuple[QueryStatus, CacheTier | None]] = []
+        remote_keys = self._remote_delivery_keys.get(request_id)
+        if remote_keys is None and request_id in self._remote_fw_dram._request_hints:
+            remote_keys = self._remote_delivery_keys.setdefault(request_id, set())
+        # Only the caller adds selections; progress may remove them. Insert
+        # before observing residency so a concurrent fetch completion wins.
+        tentative: dict[BlockKey, int] = {}
+        try:
+            for key in keys:
+                selected = (
+                    remote_keys is not None
+                    and key in remote_keys
+                    and key not in tentative
                 )
-                if not fetching_locally:
-                    if self._remote_fw_dram.query(key, request_id):
-                        statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
-                        continue
-                    if not self._has_complete_local(key):
-                        statuses.append((QueryStatus.MISS, None))
-                        continue
-            if residency is not None and residency.state is _LocalDramState.READY:
-                statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
-            elif residency is not None and residency.state is _LocalDramState.FILLING:
-                statuses.append((QueryStatus.FETCHING, CacheTier.LOCAL_G2))
-            elif record is not None and record.g3 is not None:
-                statuses.append((QueryStatus.FETCHABLE, CacheTier.G3))
-            # Remote hints are request-scoped and advisory, not block residency.
-            elif request_id is not None and self._remote_fw_dram.query(key, request_id):
-                statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
-                if not remote_keys:
-                    remote_keys = self._remote_delivery_keys.setdefault(
-                        request_id, set()
+                if remote_keys is not None and not selected:
+                    remote_keys.add(key)
+                    tentative.setdefault(key, len(statuses))
+                record = self._block_record_map.get(key)
+                if record is not None and record.pending_invalidation:
+                    statuses.append((QueryStatus.MISS, None))
+                    continue
+                local = record.local_dram if record is not None else None
+                if selected:
+                    fetching_locally = (
+                        local is not None
+                        and local.state is _LocalDramState.FILLING
+                        and any(
+                            op_id[0] == "fetch"
+                            and (
+                                op := self._local_dram._pending_residency_ops.get(op_id)
+                            )
+                            is not None
+                            and op.request_id == request_id
+                            and key not in op.results
+                            for op_id in record.active_op_ids
+                        )
                     )
-                remote_keys.add(key)
-            else:
-                statuses.append((QueryStatus.MISS, None))
+                    if not fetching_locally:
+                        if self._remote_fw_dram.query(key, request_id):
+                            statuses.append(_REMOTE_FETCHABLE)
+                            continue
+                        if not self._has_complete_local(key):
+                            statuses.append((QueryStatus.MISS, None))
+                            continue
+                if local is not None and local.state is _LocalDramState.READY:
+                    statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
+                elif local is not None and local.state is _LocalDramState.FILLING:
+                    statuses.append((QueryStatus.FETCHING, CacheTier.LOCAL_G2))
+                elif record is not None and record.g3 is not None:
+                    statuses.append((QueryStatus.FETCHABLE, CacheTier.G3))
+                # Remote hints are request-scoped and advisory, not block residency.
+                elif request_id is not None and self._remote_fw_dram.query(
+                    key, request_id
+                ):
+                    statuses.append(_REMOTE_FETCHABLE)
+                else:
+                    statuses.append((QueryStatus.MISS, None))
+        finally:
+            # Keep a tentative selection only if its key resolved to the remote path.
+            for key, index in tentative.items():
+                if index >= len(statuses) or statuses[index] != _REMOTE_FETCHABLE:
+                    remote_keys.discard(key)
         if self._query_diagnostics is not None:
             self._log_query_diagnostics(statuses, request_id)
         return statuses
@@ -622,8 +647,7 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
+        op_handle = next(self._op_handles)
         deadline = self._operation_deadline()
         local_dram = self._local_dram
         normalized = {
@@ -710,8 +734,6 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
     ) -> OpHandle:
         declaration = self._validate_expected_layout(expected_layout)
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
         if self._local_dram is not None:
             blocks = {
                 key: self._normalize_descriptors(descriptors)
@@ -733,6 +755,7 @@ class _KVCRCore:
                     raise ValueError(
                         "deposit pieces must belong to the local key layout"
                     )
+        op_handle = next(self._op_handles)
         with self._state_lock:
             if self._local_dram is None:
                 self._complete(
@@ -774,6 +797,7 @@ class _KVCRCore:
         *,
         source_endpoint: str | None = None,
         move: bool = False,
+        _op_handle: OpHandle | None = None,
     ) -> OpHandle:
         if move:
             if not isinstance(source_endpoint, str) or not source_endpoint:
@@ -784,10 +808,10 @@ class _KVCRCore:
             [""] if expected_layout is None else expected_layout
         )
         requested = list(declaration)
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
         local_dram = self._local_dram
         ordered_keys = tuple(dict.fromkeys(keys))
+        # Independent callers register their handle before a synchronous hit.
+        op_handle = next(self._op_handles) if _op_handle is None else _op_handle
         with self._state_lock:
             if local_dram is None:
                 self._complete(
@@ -868,6 +892,10 @@ class _KVCRCore:
     # TODO: Expose individual entry completions as they become available.
     def poll_completed(self) -> Iterable[OpResult]:
         self._progress.raise_if_failed()
+        if self._background_error is not None:
+            # Completion processing failed on progress; report it here, once.
+            error, self._background_error = self._background_error, None
+            raise error
         self._notify_transfer_errors(self._progress.take_completed())
         progress_items = self._pending_progress_items
         self._pending_progress_items = []
@@ -879,11 +907,8 @@ class _KVCRCore:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
                 self._drain_invalidation()
-        self._independent_hint_handler.poll()
-        completed = self._completion_queue
-        self._completion_queue = []
-        if self._independent_hint_handler._pending_operations:
-            completed = self._independent_hint_handler.finish(completed)
+            completed = self._completion_queue
+            self._completion_queue = []
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)
@@ -918,10 +943,11 @@ class _KVCRCore:
 
     def get_stats(self) -> TelemetryStats | None:
         self._progress.raise_if_failed()
-        stats = self._stats
-        if stats is None:
+        if self._stats is None:
             return None
+        replacement = self._stats_factory() if self._stats_factory else None
         with self._state_lock:
+            stats, self._stats = self._stats, replacement
             resources = {
                 "block_records": len(self._block_record_map),
                 "in_flight_ops": self._outstanding_operations,
@@ -937,7 +963,6 @@ class _KVCRCore:
                 resources.update(self._g3.telemetry_state())
         for resource, value in resources.items():
             stats.set_gauge(STATE_METRIC, value, (resource,))
-        self._stats = self._stats_factory() if self._stats_factory else None
         return stats
 
     def close(self) -> None:
@@ -1499,7 +1524,10 @@ class _KVCRCore:
         trace = self._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.completed(entries)
-        self._completion_queue.append((op_handle, entries))
+        if op_handle in self._independent_hint_handler._pending_operations:
+            self._independent_hint_handler._completed.append((op_handle, entries))
+        else:
+            self._completion_queue.append((op_handle, entries))
 
     # Timing and telemetry helpers.
 

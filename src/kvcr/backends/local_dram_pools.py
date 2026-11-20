@@ -180,7 +180,7 @@ class _SourceState:
     """Reader state shared with progress; completions return work to the caller."""
 
     def __init__(self) -> None:
-        # Owner paths take _state_lock before this lock; progress takes only this.
+        # Writers take _state_lock first; the source fast path takes only this.
         self.lock = threading.Lock()
         # None keeps allocated, unpublished keys on the caller's preparation path.
         self.index: dict[BlockKey, _LocalDramResidency | None] = {}
@@ -733,6 +733,37 @@ class _LocalDramPools:
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
         required = Counter(label.partition(":")[0] for label in layout)
+        local = self._kvcr._local_dram
+        if local._capacity_waiters and not local._resuming_capacity_waiters:
+            now = self._kvcr._clock()
+            deferred = self._kvcr._independent_hint_handler._deferred
+            for waiter in local._capacity_waiters:
+                op, key = waiter.op, waiter.key
+                if (
+                    key not in op.capacity_waiters
+                    or key in op.results
+                    or now >= op.deadline
+                ):
+                    continue
+                record = self._kvcr._block_record_map.get(key)
+                if (
+                    record is not None
+                    and record.local_dram is not None
+                    and record.local_dram.state is _LocalDramState.DISCARDING
+                ):
+                    continue
+                waiting_layout = (
+                    op.requested_layout
+                    if op.sources is None
+                    else op.key_layout or (ref.label for ref in op.sources[key])
+                )
+                if any(label.partition(":")[0] in required for label in waiting_layout):
+                    # A caller may have freed a slot but deferred its FIFO head.
+                    return None, [], True
+                if (op.op_id[1], key) not in deferred:
+                    break
+                # Progress resumes a deferred waiter and the pass behind it, so
+                # older waiters for other pools stay ahead of this allocation.
         if all(
             len(self._free_slots[name]) >= count for name, count in required.items()
         ):
@@ -887,6 +918,10 @@ class _LocalDramPools:
         return residency._cached_size
 
     def _update_capacity_pressure(self) -> None:
-        if self._kvcr._capacity_needed_callback is None:
+        # The caller rechecks pressure; skip both the scan and callback on progress.
+        if (
+            self._kvcr._capacity_needed_callback is None
+            or threading.current_thread() is self._kvcr._progress._thread
+        ):
             return
         self._kvcr._update_capacity_pressure(self._reclaimable_slots())
