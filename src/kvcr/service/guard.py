@@ -18,8 +18,9 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
+import msgspec
+
 from ..api import KVCRBindings
-from ..backends.local_disk import _G3Residency
 from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -143,36 +144,20 @@ class _PoolLease:
             raise failure
 
 
-def _without_g3(
-    records: dict[BlockKey, _BlockRecord],
-) -> dict[BlockKey, _BlockRecord]:
-    """Strip the half a Guard cannot serve, in place.
-
-    In place because the table can hold a tier's worth of blocks and a second
-    copy of it is exactly what take_records avoids.
-    """
-    for key in [key for key, record in records.items() if record.local_dram is None]:
-        del records[key]
-    for record in records.values():
-        record.g3 = None
-    return records
-
-
 def _with_g3(
     records: dict[BlockKey, _BlockRecord],
-    g3_records: Mapping[BlockKey, tuple[_G3Residency, int]],
+    g3_records: Mapping[BlockKey, _BlockRecord],
 ) -> dict[BlockKey, _BlockRecord]:
     """Put the kept half back, in place, for the primary that will open G3.
 
     A block the Guard evicted keeps its G3 residency and loses its G2 one, which
     is what a returning primary has to be told.
     """
-    for key, (g3, position) in g3_records.items():
-        record = records.get(key)
-        if record is None:
-            records[key] = _BlockRecord(g3=g3, position=position)
-        else:
-            record.g3 = g3
+    for key, disk in g3_records.items():
+        record = records.setdefault(key, disk)
+        record.g3 = disk.g3
+        if record.block_hash is None:
+            record.block_hash = disk.block_hash
     return records
 
 
@@ -193,7 +178,7 @@ class _RecoveryState:
         self._journal: RecoveryJournal | None = None
         self.mirror: _RecoveryMirror | None = None
         # Recovered half a Guard cannot serve; kept for the next primary, which can.
-        self._g3_records: dict[BlockKey, tuple[_G3Residency, int]] = {}
+        self._g3_records: dict[BlockKey, _BlockRecord] = {}
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -266,15 +251,29 @@ class _RecoveryState:
         return records
 
     def prepare_to_serve(
-        self, records: dict[BlockKey, _BlockRecord]
-    ) -> dict[BlockKey, _BlockRecord]:
+        self, core: _KVCRCore, records: dict[BlockKey, _BlockRecord]
+    ) -> None:
         """Keep the unserved G3 half and transfer the G2 half in place."""
         self._g3_records = {
-            key: (record.g3, record.position)
-            for key, record in records.items()
-            if record.g3 is not None
+            key: record for key, record in records.items() if record.g3 is not None
         }
-        return _without_g3(records)
+        for key, disk in self._g3_records.items():
+            if disk.local_dram is None:
+                del records[key]
+            else:
+                records[key] = msgspec.structs.replace(disk, g3=None)
+                disk.local_dram = None
+        if self._g3_records:
+            core._local_dram._pools.observe_residency(self._keep_disk_hash)
+        core.adopt_recovery_records(records, retained_g3=self._g3_records)
+
+    def _keep_disk_hash(self, key: BlockKey, record: _BlockRecord) -> None:
+        disk = self._g3_records.get(key)
+        if disk is not None:
+            if disk.block_hash is None:
+                disk.block_hash = record.block_hash
+            # The disk copy keeps the indexed identity after G2 eviction.
+            record.block_hash = disk.block_hash if record.complete_dram else None
 
     def release_snapshot_region(self) -> None:
         self.attachment.release_snapshot_region()
@@ -1017,16 +1016,14 @@ class _Guard:
         bound would leave hanging. G2 only, no G3: that half is kept whole for
         the replacement. A new NIXL agent name keeps peers off the dead one's.
         """
-        records = self._recovery.prepare_to_serve(records)
-        recovered_blocks = len(records)
-
         core = self._core
         if core is None:
             raise RecoveryMirrorError("Guard transport was not prepared")
         agent_name = core.nixl_agent_name
         # Shared, not copied: a later confirmed death must reach a serving core.
         core._remote_fw_dram._dangling_ops.dead_incarnations = self._dead_incarnations
-        core.adopt_recovery_records(records)
+        self._recovery.prepare_to_serve(core, records)
+        recovered_blocks = len(records)
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()

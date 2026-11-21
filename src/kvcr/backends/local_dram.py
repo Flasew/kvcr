@@ -38,7 +38,7 @@ from .local_dram_pools import (
 )
 
 if TYPE_CHECKING:
-    from ..runtime.core import _KVCRCore
+    from ..runtime.core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class _NamedSource:
     layout: tuple[str, ...]
     move_keys: set[BlockKey] | None
     cached_keys: list[BlockKey] = field(default_factory=list)
+    block_hashes: Mapping[BlockKey, int] | None = None
 
     def invalidate_cached(self, core: "_KVCRCore") -> None:
         """Send one invalidation for the complete local hits found so far."""
@@ -256,6 +257,7 @@ class _LocalDram:
             kvcr, region, resume_capacity_waiters=self._resume_capacity_waiters
         )
         self._backend = region.backend
+        self._retained_g3: Mapping[BlockKey, _BlockRecord] = {}
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         self._pending_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         self._capacity_waiters: deque[_CapacityWaiter] = deque()
@@ -522,6 +524,13 @@ class _LocalDram:
             return None
         layout = op.requested_layout
         record = self._kvcr._block_record(key)
+        named = op.named_source
+        source_hash = named.block_hashes[key] if named and named.block_hashes else None
+        if source_hash is not None and not self._accepts_source_hash(
+            key, record, source_hash
+        ):
+            op.results[key] = _FAILED_RESULT
+            return None
         residency = record.local_dram
         source = op.fill_sources.get(key)
         if residency is not None and residency.state is _LocalDramState.DISCARDING:
@@ -557,7 +566,14 @@ class _LocalDram:
             ready = [residency.slots[index] for index in indices]
             self._kvcr._record_access((key,))
             op.results[key] = self._pools._new_public_claim(key, residency, slots=ready)
-            named = op.named_source
+            if (
+                source_hash is not None
+                and record.complete_dram
+                and self._kvcr._cache_block_hash(key, record, source_hash)
+            ):
+                # Cached hits have no store event to publish the new identity.
+                self._pools._residency_observer(key, record)
+                self._kvcr._update_block_hash_map(self._kvcr._block_record_map, (key,))
             if (
                 named is not None
                 and named.move_keys is not None
@@ -665,7 +681,7 @@ class _LocalDram:
                 and not residency.pending_deposits
             ):
                 with state.lock:
-                    if self._kvcr.framework_control is not None:
+                    if key in state.index:
                         state.index[key] = None
                     residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:
@@ -834,6 +850,11 @@ class _LocalDram:
                             source,
                         )
                     if not pending:
+                        # A deposit can complete a waiting named fetch.
+                        source_hash = None
+                        if writer is None or len(record.in_flight_ops or ()) > 1:
+                            source_hash = self._pending_source_hash(key, record)
+                        self._kvcr._cache_block_hash(key, record, source_hash)
                         self._pools._residency_observer(key, record)
                         committed.append(key)
             residency.settle()
@@ -921,6 +942,34 @@ class _LocalDram:
             self._kvcr._prune_block_record(key)
         self._resume_capacity_waiters()
         return committed
+
+    def _accepts_source_hash(
+        self, key: BlockKey, record: "_BlockRecord", offered: int
+    ) -> bool:
+        known = record.block_hash
+        if known is None and (disk := self._retained_g3.get(key)) is not None:
+            known = disk.block_hash
+        if known is None:
+            known = self._pending_source_hash(key, record)
+        if known is None:
+            adapter = self._kvcr._key_adapter
+            if adapter is None:
+                return True
+            try:
+                known = adapter.encode_to_router(key)
+            except Exception:
+                return False
+        return type(known) is int and known == offered
+
+    def _pending_source_hash(self, key: BlockKey, record: "_BlockRecord") -> int | None:
+        for op_id in record.in_flight_ops or ():
+            op = self._pending_residency_ops.get(op_id)
+            if op is None or key not in op.claimed_keys or key in op.results:
+                continue
+            named = op.named_source
+            if named is not None and named.block_hashes:
+                return named.block_hashes[key]
+        return None
 
     def _resolve_fetch_waiter(
         self,

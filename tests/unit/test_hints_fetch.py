@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Request advice and independent prefetch/move hint execution."""
 
-import threading
-from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import msgspec
@@ -19,10 +17,11 @@ from _kvcr_test_utils import (
     _new_kvcr,
     _poll_until,
     _record_hint_results,
+    _recovered_record,
     _router_hint,
     _wait_until,
 )
-from test_kvcr_remote_target import _Pair
+from test_kvcr_remote_target import _Pair, _Peer
 
 from kvcr.backends.remote_ops import _FetchGroup, _KeysToFetch, _TargetPullOp
 from kvcr.config import KVCRConfig, RemoteFWDramOptions
@@ -47,9 +46,9 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
     return taken
 
 
-class _PrefixAdapter:
+class _TestAdapter:
     def encode_to_router(self, key):
-        return int.from_bytes(key[:8], "big")
+        return {_KEY: 123, _TAIL_KEY: 124}.get(key, int.from_bytes(key[:8], "big"))
 
 
 def _key(block_hash: int) -> BlockKey:
@@ -62,7 +61,7 @@ def _fetch_kvcr(monkeypatch):
         FakePrimaryPinning(),
         FakeBytesControl(),
         KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
-        key_adapter=_PrefixAdapter(),
+        key_adapter=_TestAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False, opportunistic_query=False
         ),
@@ -209,10 +208,7 @@ def _group(**changes):
 def pair(monkeypatch):
     """Two peers with reverse lookup; the source holds _KEY and both record
     hint results: admission at the source, the transfer at the target."""
-    pair = _Pair()
-    pair.source.kvcr._core._key_adapter = SimpleNamespace(
-        decode_from_router={123: _KEY, 124: _TAIL_KEY}.__getitem__
-    )
+    pair = _Pair(key_adapter=_TestAdapter())
     pair.source.deposit(_KEY)
     pair.source_reports, pair.target_reports = (
         _record_hint_results(monkeypatch, peer.kvcr)
@@ -252,9 +248,6 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     source, target = pair.source, pair.target
     source.deposit(_TAIL_KEY, 1)
     marked = target.kvcr._core._no_retain
-    target.kvcr._core._key_adapter = SimpleNamespace(
-        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
-    )
     remote = target.kvcr._core._remote_fw_dram
     remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
     hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
@@ -296,14 +289,13 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     "source_pieces,pieces", [(2, (0,)), (1, (0,)), (2, (0, 1)), (2, (1, 0))]
 )
 def test_evict_on_fetch_delivery_removes_only_complete_keys(source_pieces, pieces):
-    pair = _Pair()
+    pair = _Pair(key_adapter=_TestAdapter())
     source, target = pair.source, pair.target
     source.agent.state = "DONE"
     layout = ["", ":tail"]
     refs = [source.ref(), source.ref(1, ":tail")][:source_pieces]
     stored = source.kvcr.deposit({_KEY: refs}, expected_layout=layout)
     assert dict(_poll_until(source.kvcr, bool))[stored][_KEY].success
-    target.kvcr._core._key_adapter = SimpleNamespace(encode_to_router=lambda key: 123)
     hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
     target.kvcr.submit_hint(_envelope(hint), "req")
     destinations = [target.ref(i, layout[piece]) for i, piece in enumerate(pieces)]
@@ -322,9 +314,6 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, mov
     keys = (_KEY, _TAIL_KEY)
     core = target.kvcr._core
     endpoint = source.control.endpoint
-    core._key_adapter = SimpleNamespace(
-        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
-    )
     hint = _fetch("action", endpoint, (123, 124), "kv.evict_on_fetch")
     target.kvcr.submit_hint(_envelope(hint), "req")
     held, send = [], target.control.send
@@ -399,9 +388,6 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     if existing:
         handle = kvcr.deposit({_KEY: [target.ref()]}, expected_layout=layout)
         assert dict(_poll_until(kvcr, bool))[handle][_KEY].success
-    core._key_adapter = SimpleNamespace(
-        encode_to_router=lambda key: 123, decode_from_router={123: _KEY}.__getitem__
-    )
     action = _HintAction("nr", "kv.no_retain", "1.0", {
         "block_hashes": [123, 999, 123], "no_retain": True,
     })  # fmt: skip
@@ -426,7 +412,7 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     report = pair.target_reports.pop()
     failures = {999: "not_found"}
     if protected or not existing:
-        failures[123] = "protected" if protected else "source_not_transferable"
+        failures[123] = "protected" if protected else "not_found"
     assert report.failures == failures
     assert report.status is (
         HintStatus.FAILED if 123 in failures else HintStatus.COMPLETED
@@ -454,7 +440,7 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     "reason",
     [
         "source_has_no_managed_dram",
-        "key_adapter_unavailable",
+        "block_hash_map_unavailable",
         "self_destination",
         "destination-less hints are not currently supported",
         "no_retain is not supported by this hint",
@@ -470,8 +456,9 @@ def test_independent_hints_are_rejected_at_the_source_before_resolution(
         kvcr, results = _fetch_kvcr(monkeypatch)
     elif reason == "self_destination":
         destination = pair.source.control.endpoint
-    elif reason == "key_adapter_unavailable":
-        kvcr._core._key_adapter = None
+    elif reason == "block_hash_map_unavailable":
+        kvcr = _Peer("source").kvcr
+        results = _record_hint_results(monkeypatch, kvcr)
     hint = _independent("a1", destination, [1], action_type)
     if reason.startswith("no_retain"):
         hint.payload["no_retain"] = False
@@ -561,20 +548,86 @@ def test_destination_rejects_unusable_requests(pair, changes, reason, monkeypatc
     _idle(pair)
 
 
-def test_all_failed_resolution_runs_under_the_owner_lock(pair, monkeypatch):
-    source = pair.source.kvcr._core
-    owner = threading.get_ident()
-
-    def decode(block_hash):
-        assert threading.get_ident() == owner and source._state_lock._is_owned()
-        raise KeyError(block_hash)
-
-    monkeypatch.setattr(source._key_adapter, "decode_from_router", decode)
+def test_unresolved_prefetch_is_reported_without_forwarding(pair):
     _submit(pair, "kv.prefetch", hashes=(999,))
     [result] = pair.source_reports
     assert result.status is HintStatus.FAILED and result.failures == {999: "not_found"}
     assert not pair.source.control.sent and not pair.target_reports
     _idle(pair)
+
+
+@pytest.mark.parametrize(
+    "transfer", ["new", "cached", "failed", "deposit_first", "deposit_last"]
+)
+def test_move_into_guard_preserves_hash_collisions(transfer, monkeypatch):
+    pair = _Pair()
+    guard = pair.target.kvcr
+    unidentified = transfer in ("deposit_first", "deposit_last")
+    for peer, key in ((pair.source, _KEY), (pair.target, b"recovered")):
+        if peer is pair.target and unidentified:
+            if transfer == "deposit_first":
+                peer.deposit(key, 1)
+            continue
+        record = _recovered_record(g2=[("", 0)])
+        record.block_hash = 123
+        peer.kvcr._core.adopt_recovery_records({key: record}, retained_g3={})
+    if transfer == "cached":
+        pair.target.deposit(_KEY, 1)
+    reports = _record_hint_results(monkeypatch, guard)
+    pair.source.agent.state = "DONE"
+    _submit(pair, "kv.move")
+    if transfer == "failed":
+        _invalidate(pair.source.kvcr, (_KEY,))
+    pair.until(lambda: reports)
+    _idle(pair)
+    if transfer == "deposit_last":
+        pair.target.deposit(b"recovered", 1)
+    if transfer == "failed":
+        assert reports[0].status is HintStatus.FAILED
+        assert guard._core.resolve_hashes((123,)) == (
+            {(("",), (16,)): {b"recovered": 123}},
+            {},
+        )
+    else:
+        assert reports[0].status is HintStatus.COMPLETED
+        reason = "resolution_failed" if unidentified else "ambiguous_hash"
+        assert guard._core.resolve_hashes((123,)) == ({}, {123: reason})
+        invalidate = _router_hint(None, action_type="kv.invalidate")
+        guard.submit_hint(invalidate)
+        guard.poll_completed()
+        hit = (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        assert guard.query((_KEY, b"recovered")) == [hit, hit]
+        _invalidate(guard, (b"recovered",))
+        guard.poll_completed()
+        guard.submit_hint(invalidate)
+        guard.poll_completed()
+        assert guard.query((_KEY,)) == [_MISS]
+
+
+@pytest.mark.parametrize("identity", ["cached", "retained_disk", "adapter"])
+def test_move_preserves_source_on_hash_conflict(pair, identity):
+    target = pair.target.kvcr._core
+    if identity == "adapter":
+        target._key_adapter = Mock(encode_to_router=lambda k: 456 if k == _KEY else 124)
+    else:
+        target._key_adapter = None
+        cached = identity == "cached"
+        record = _recovered_record(g2=[("", 0)]) if cached else _recovered_record(g3=0)
+        record.block_hash = 456
+        target.adopt_recovery_records(
+            {_KEY: record} if cached else {},
+            retained_g3={} if cached else {_KEY: record},
+        )
+    pair.source.deposit(_TAIL_KEY, 1)
+    pair.source.agent.state = "DONE"
+    _submit(pair, "kv.move", hashes=(123, 124))
+    hit = (QueryStatus.HIT, CacheTier.LOCAL_G2)
+    keys = (_KEY, _TAIL_KEY)
+    pair.until(lambda: pair.target_reports)
+    _idle(pair)
+    assert pair.source.kvcr.query(keys) == [hit, _MISS]
+    assert pair.target_reports[0].failures == {123: "operation_failed"}
+    assert pair.target.kvcr.query(keys) == [hit if identity == "cached" else _MISS, hit]
 
 
 @pytest.mark.parametrize("action", ["kv.prefetch", "kv.move"])

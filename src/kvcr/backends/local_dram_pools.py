@@ -264,7 +264,7 @@ class _LocalDramPools:
             return state.operations
 
     def _mark_source_pending(self, key: BlockKey) -> None:
-        if self._kvcr.framework_control is not None:
+        if self._kvcr._source_index_enabled:
             with self._source_state.lock:
                 self._source_state.index[key] = None
 
@@ -276,7 +276,7 @@ class _LocalDramPools:
     ) -> None:
         # Finishing an existing fill must not reopen a source being drained.
         if (
-            self._kvcr.framework_control is None
+            not self._kvcr._source_index_enabled
             or residency.pending_labels
             or self._kvcr._block_record_map[key].pending_invalidation
         ):
@@ -589,7 +589,7 @@ class _LocalDramPools:
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
             with state.lock:
                 residency.retire_on_release = True
-                if self._kvcr.framework_control is not None:
+                if key in state.index:
                     state.index[key] = None
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:

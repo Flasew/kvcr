@@ -447,7 +447,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})
         core._remote_fw_dram._dangling_ops = _DanglingOps(core._remote_fw_dram)
 
-        def adopt(records) -> None:
+        def adopt(records, *, retained_g3) -> None:
+            assert retained_g3 is guard._recovery._g3_records
             core._block_record_map = records
             order.append(("adopt", tuple(records)))
 
@@ -539,7 +540,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # gives: the half-written G2 slot is dropped, and the G3 halves are
         # carried whole -- g3_only no longer names any live record, so a
         # rebuild from the core's map could not produce it.
-        retained_g3 = guard._recovery._g3_records[first][0]
+        retained_g3 = guard._recovery._g3_records[first].g3
         records = cores[0]._block_record_map
         first_residency = records[first].local_dram
         assert first_residency is not None
@@ -572,7 +573,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
         assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
-        assert guard._recovery._g3_records[fresh][0].slots[0] == 7
+        assert guard._recovery._g3_records[fresh].g3.slots[0] == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]
         events = [
             message
@@ -869,7 +870,7 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     guard._recovery.attachment = attachment
     mirror = guard._recovery.mirror = _RecoveryMirror(("",))
     g3_records = guard._recovery._g3_records = {
-        BlockKey(b"g3"): (_G3Residency(("",), (0,)), -1)
+        BlockKey(b"g3"): _recovered_record(g3=0)
     }
     guard._pool_lease.current = holder
 

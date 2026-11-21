@@ -9,10 +9,11 @@ import hmac
 import logging
 import mmap
 import struct
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
 from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
@@ -25,6 +26,7 @@ from ..backends.local_dram_pools import (
 )
 from ..config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from ..runtime.core import _BlockRecord, _KVCRCore
+from ..runtime.progress import _STARTUP_TIMEOUT_SECONDS
 from ..types import BlockKey, RecoveryMirrorError
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
 from .protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
@@ -100,44 +102,34 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         | None
     ) = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
+    block_hash: int | bytes | None = None
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
 _RECOVERY_DECODER = msgspec.msgpack.Decoder(_RecoveryBlock)
+_TOMBSTONE = _RECOVERY_ENCODER.encode(())  # Both residencies default to None.
 
 
 # TODO: Carry access history. Recovered blocks arrive with last_access unset,
 # so LRU uses position until first access and their relative recency is lost.
 # Journaling recency faithfully would cost a write per cache hit, since
 # last_access changes on every access.
-def _is_recoverable(record: _BlockRecord) -> bool:
-    """Whether this record still names bytes a later holder of the pool can use.
-
-    Both carriers of recovered state ask this -- the frames written to a
-    handback region and the records a standing-down Guard keeps -- so that the
-    two cannot come to describe different pools.
-    """
-    local_dram = record.local_dram
-    return record.g3 is not None or (
-        local_dram is not None
-        and local_dram.state is _LocalDramState.READY
-        and not local_dram.pending_labels
-    )
-
-
-def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
+def _project_recovery_record(record: _BlockRecord) -> tuple:
     disk = record.g3
-    local_dram = record.local_dram
-    complete = (
-        local_dram is not None
-        and local_dram.state is _LocalDramState.READY
-        and not local_dram.pending_labels
-    )
-    return _RecoveryBlock(
-        g2=local_dram.slots if complete else None,
-        g3=(disk.layout, disk.slots) if disk is not None else None,
-        position=record.position,
-    )
+    g3 = (disk.layout, disk.slots) if disk is not None else None
+    slots = record.local_dram.slots if record.complete_dram else None
+    fields = slots, g3, record.position
+    if record.block_hash is not None and (slots is not None or g3 is not None):
+        return (*fields, record.block_hash)
+    return fields  # Preserve the original three-field encoding for legacy rows.
+
+
+def _recovery_payload(key: bytes, record: _BlockRecord, limit: int) -> bytes | None:
+    available = limit - _FRAME_HEADER.size - len(key)
+    if isinstance(record.block_hash, bytes) and len(record.block_hash) > available:
+        return None
+    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+    return payload if len(payload) <= available else None
 
 
 def _decode_recovery_record(
@@ -170,6 +162,7 @@ def _decode_recovery_record(
         ),
         g3=disk,
         position=recovered.position,
+        block_hash=recovered.block_hash,
     )
 
 
@@ -206,6 +199,7 @@ class RecoveryJournal:
         self._published_local: int | None = None
         self._consumed_local: int | None = None
         self._invalid_local = False
+        self._backfill_deadline: float | None = None
 
     def reset(self) -> None:
         """Reset while no producer or consumer is using the pool."""
@@ -216,8 +210,10 @@ class RecoveryJournal:
         self._published_local = self._consumed_local = 0
         self._invalid_local = False
 
-    def publish(self, record_type: int, key: bytes, payload: bytes) -> bool:
-        """Publish one typed keyed frame, or permanently invalidate the journal."""
+    def publish(
+        self, record_type: int, key: bytes, payload: bytes, *, optional: bool = False
+    ) -> bool:
+        """Publish a frame. Only optional updates may retry when the ring fills."""
         mapping = self._pool._require_mapping()
         if record_type not in _RECORD_TYPES:
             raise ValueError(f"unknown journal record type: {record_type}")
@@ -239,11 +235,25 @@ class RecoveryJournal:
         # Acquire: what follows writes into space this cursor declares free, and
         # those writes are unordered against the consumer's reads on ARM.
         consumed = self._consumed.load_acquire()
+        while (
+            self._backfill_deadline is not None
+            and self._capacity - (published - consumed) < stored_size <= self._capacity
+            and self._valid_cursors(published, consumed)
+        ):
+            if self.is_invalid():
+                self._invalid_local = True
+                return False
+            if time.monotonic() >= self._backfill_deadline:
+                raise TimeoutError("Guard did not drain the hash backfill journal")
+            time.sleep(0.001)
+            consumed = self._consumed.load_acquire()
         if not self._valid_cursors(published, consumed):
             return self._invalidate(
                 f"publish cursors are invalid: {published=} {consumed=}"
             )
         if stored_size > self._capacity - (published - consumed):
+            if optional:
+                return False
             return self._invalidate(
                 f"ring is full: {stored_size} bytes needed, "
                 f"{self._capacity - (published - consumed)} available"
@@ -381,10 +391,7 @@ class _RecoveryMirror:
         for key, record in records.items():
             local_dram = record.local_dram
             if local_dram is not None:
-                if (
-                    local_dram.state is not _LocalDramState.READY
-                    or local_dram.pending_labels
-                ):
+                if not record.complete_dram:
                     record.local_dram = None
                 else:
                     local_dram.pending_deposits = 0
@@ -404,7 +411,7 @@ class _RecoveryMirror:
             record.in_flight_ops = None
             record.access_count = 0
             record.last_access = None
-            if not _is_recoverable(record):
+            if record.local_dram is None and record.g3 is None:
                 stale.append(key)
         for key in stale:
             del records[key]
@@ -423,40 +430,51 @@ class _RecoveryMirror:
 
 def _attach_journal(
     local_dram: _LocalDramPools, journal: RecoveryJournal, g3: _G3 | None = None
-) -> None:
-    """Attach stable G2/G3 residency publication to one journal."""
+) -> Callable[[BlockKey, _BlockRecord], bool]:
+    """Attach residency publication and return the nonblocking hash repair writer."""
     enabled = True
+    limit = min(_MAX_FRAME_SIZE, journal._capacity - journal._capacity % _ALIGNMENT)
 
-    def publish(key: BlockKey, record: _BlockRecord) -> None:
+    def publish(key: BlockKey, record: _BlockRecord, *, optional: bool = False) -> bool:
         nonlocal enabled
         if not enabled:
-            return
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+            return True
+        payload = _recovery_payload(key, record, limit)
+        if payload is None:
+            tombstone_size = _FRAME_HEADER.size + len(key) + len(_TOMBSTONE)
+            if tombstone_size > (limit if optional else _MAX_FRAME_SIZE):
+                # A live repair can leave a legacy snapshot's unknown row intact.
+                return True
+            # Withdraw any older mirror entry. A tombstone still has to fit the ring.
+            payload = _TOMBSTONE
         try:
-            if not journal.publish(_RECORD_BLOCK, bytes(key), payload):
+            if not journal.publish(
+                _RECORD_BLOCK, bytes(key), payload, optional=optional
+            ):
+                if optional and not journal.is_invalid():
+                    return False
                 logger.warning(
                     "KVCR recovery publication disabled after a rejected frame"
                 )
                 enabled = False
+        except TimeoutError:
+            raise
         except Exception:
             logger.warning("KVCR recovery publication failed", exc_info=True)
             enabled = False
             with suppress(Exception):
                 journal.invalidate()
+        return True
 
     if g3 is not None:
 
         def preflight(key: BlockKey, record: _BlockRecord, disk: _G3Residency) -> bool:
             candidate = msgspec.structs.replace(record, g3=disk)
-            payload = _RECOVERY_ENCODER.encode(_project_recovery_record(candidate))
-            size = _FRAME_HEADER.size + len(key) + len(payload)
-            return (
-                size <= _MAX_FRAME_SIZE
-                and size + (-size % _ALIGNMENT) <= journal._capacity
-            )
+            return _recovery_payload(key, candidate, limit) is not None
 
         g3.observe_residency(publish, recovery_preflight=preflight)
     local_dram.observe_residency(publish)
+    return partial(publish, optional=True)
 
 
 def install_recovery_records(
@@ -561,10 +579,19 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         dangling.dead_incarnations.update(hold._dead_incarnations)
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
-    _attach_journal(
-        core._local_dram._pools, RecoveryJournal(hold._attachment), core._g3
-    )
-    install_recovery_records(core, claimed.recovered.take_records())
+    journal = RecoveryJournal(hold._attachment)
+    try_publish_hash = _attach_journal(core._local_dram._pools, journal, core._g3)
+    # A legacy handback can hold many rings' worth of missing block hashes.
+    records = claimed.recovered.take_records()
+    if records:
+        timeout = core.config.startup_timeout_seconds or _STARTUP_TIMEOUT_SECONDS
+        journal._backfill_deadline = time.monotonic() + timeout
+    try:
+        install_recovery_records(core, records)
+    finally:
+        if records:
+            journal._backfill_deadline = None
+    core._try_publish_hash = try_publish_hash
     hold.hand_listener_to(claimed.adopt_listener)
 
 
@@ -598,12 +625,15 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
 def _recovery_frames(
     records: Mapping[BlockKey, _BlockRecord],
 ) -> Iterator[tuple[int, bytes, bytes]]:
-    """Every frame a returning primary needs to rebuild this state."""
+    """Drop unencodable blocks from both the handback and the closed core's mirror."""
     for key, record in records.items():
-        if not _is_recoverable(record):
+        if record.g3 is None and not record.complete_dram:
             continue
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
-        yield _RECORD_BLOCK, bytes(key), payload
+        payload = _recovery_payload(key, record, _MAX_FRAME_SIZE)
+        if payload is None:
+            record.g3 = record.local_dram = None  # Mirror adoption discards this row.
+        else:
+            yield _RECORD_BLOCK, bytes(key), payload
 
 
 # Bound to the pool and to the geometry: a slot index only means the same

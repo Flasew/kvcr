@@ -240,7 +240,7 @@ def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> 
 
     monkeypatch.setattr(agent, "check_xfer_state", check_state)
     kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
-    journal = Mock()
+    journal = Mock(_capacity=4096)
     journal.publish.return_value = True
     _attach_journal(kvcr._core._local_dram._pools, journal)
     events = []
@@ -991,7 +991,7 @@ def test_align_sequence_updates_policy_and_journal(
     filling_record = kvcr._core._block_record_map[filling]
     assert filling_record.local_dram.state is _LocalDramState.FILLING
     events.clear()
-    journal = Mock()
+    journal = Mock(_capacity=4096)
     journal.publish.return_value = True
     _attach_journal(kvcr._core._local_dram._pools, journal)
 
