@@ -25,6 +25,8 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWDramOptions,
 )
+from kvcr.hints.hint_types import KvHintsEnvelope as _HintEnvelope
+from kvcr.hints.hint_types import _HintAction
 from kvcr.hints.results import HintResult
 from kvcr.policy import FIFOPolicy
 from kvcr.runtime import progress as kvcr_progress
@@ -43,19 +45,6 @@ _OPEN_KVCRS: list[KVCR] = []
 
 
 _HANDED_OUT: set[int] = set()
-
-
-class _HintAction(msgspec.Struct, frozen=True):
-    action_id: str
-    action_type: str
-    action_version: str
-    payload: object
-
-
-class _HintEnvelope(msgspec.Struct, frozen=True):
-    protocol_version: str
-    message_id: str
-    actions: list[_HintAction]
 
 
 def _router_hint(
@@ -447,21 +436,42 @@ class FakeNixlAgent:
 
 
 class FakeBytesControl:
-    def __init__(self, endpoint: str = "tcp://target:1"):
+    def __init__(self, endpoint: str = "tcp://target:1", *, answers: bool = True):
         self.endpoint = endpoint
         self.sent: list[tuple[str, bytes]] = []
         self.incoming: list[bytes] = []
         self.send_result = True
+        # Peers answer a target_metadata that carries metadata, as a live source
+        # does; set False for a source that has stopped answering.
+        self.answers = answers
         self._clock = time.monotonic
 
     def send(self, endpoint: str, message: bytes) -> bool:
         self.sent.append((endpoint, message))
+        if self.send_result and self.answers:
+            payload = msgspec.msgpack.decode(message)
+            if payload.get("type") == "target_metadata" and payload.get(
+                "target_agent_metadata"
+            ):
+                self.incoming.append(
+                    msgspec.msgpack.encode(
+                        {
+                            "type": "target_metadata_ack",
+                            "sender_control_endpoint": endpoint,
+                        }
+                    )
+                )
         return self.send_result
 
     def recv(self) -> list[tuple[bytes, float]]:
         incoming = self.incoming
         self.incoming = []
         return [(message, self._clock()) for message in incoming]
+
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        # Appends to incoming signal nothing, so keep the thread polling.
+        time.sleep(min(timeout, 0.001))
+        return False
 
 
 def _mem_descriptor(
@@ -483,6 +493,17 @@ def _buffer_region(buffer, size: int, label: str = "") -> RegionDescriptor:
 
 def _decode_control_message(message: bytes) -> dict[str, Any]:
     return msgspec.msgpack.decode(message)
+
+
+def _start_write_sent(control: FakeBytesControl, index: int = 0) -> dict[str, Any]:
+    """Wait for a start_write, which a pull sends once its source has answered."""
+
+    def start_writes() -> list[dict[str, Any]]:
+        messages = (_decode_control_message(raw) for _, raw in control.sent)
+        return [message for message in messages if message["type"] == "start_write"]
+
+    _wait_until(lambda: len(start_writes()) > index)
+    return start_writes()[index]
 
 
 def _decode_notif(notif: bytes) -> dict[str, Any]:

@@ -104,10 +104,16 @@ class TelemetryStats(Protocol):
 
 
 class FrameworkControl(Protocol):
+    endpoint: str | None
+
     def send(self, endpoint: str, message: bytes) -> bool: ...
 
     def recv(self) -> list[tuple[bytes, float]]:
         """Return messages with their local time.monotonic() receipt timestamps."""
+        ...
+
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        """Wait up to ``timeout`` for input or ``wake_fd``; True if either is ready."""
         ...
 
 
