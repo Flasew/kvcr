@@ -119,6 +119,9 @@ class KeyAdapter(Protocol):
     the external block hash published to the router (e.g. in Dynamo router, this
     is currently an unsigned 64-bit integer). Router's internal keys can be
     separate from this published hash.
+
+    KVCR calls ``encode_to_router`` from the caller's thread and from its
+    progress thread, so implementations must be thread-safe.
     """
 
     def encode_to_framework(self, key: BlockKey) -> object: ...

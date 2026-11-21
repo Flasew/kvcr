@@ -15,7 +15,13 @@ from collections.abc import Callable, Mapping
 
 import msgspec
 
-from .hint_types import HintType, _Hint, _KVInvalidateHint
+from .hint_types import (
+    HintType,
+    KvHintsEnvelope,
+    _Hint,
+    _HintAction,
+    _KVInvalidateHint,
+)
 from .results import HintResult, HintStatus
 
 # Public integration constants exported by kvcr.__init__.
@@ -29,6 +35,28 @@ _KV_HINT_PROTOCOL_VERSION = "0.1"
 # malformed integration issue.
 logger = logging.getLogger(__name__)
 _LOGGED_HINT_ISSUES: set[str] = set()
+_ENVELOPE_DECODER = msgspec.msgpack.Decoder(KvHintsEnvelope)
+
+
+def decode_hint_envelope(message: bytes) -> KvHintsEnvelope:
+    """Decode a MessagePack envelope; action validation is ``parse_hints``'s."""
+    try:
+        return _ENVELOPE_DECODER.decode(message)
+    except msgspec.ValidationError:
+        # Isolate malformed actions just as request ingress does. Keep the
+        # envelope validation, but leave action validation to the parser.
+        fields = msgspec.msgpack.decode(message)
+        actions = fields.pop("actions", None)
+        if not isinstance(actions, list):
+            raise
+        envelope = msgspec.convert({**fields, "actions": []}, type=KvHintsEnvelope)
+        envelope.actions.extend(
+            _HintAction(*map(action.get, _HintAction.__struct_fields__))
+            if isinstance(action, dict)
+            else action
+            for action in actions
+        )
+        return envelope
 
 
 def _warn_version_mismatch(

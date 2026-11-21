@@ -119,6 +119,24 @@ _ControlMessage = (
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
 
 
+class _ControlRoute(msgspec.Struct):
+    # Inspect the discriminator without allocating the peer message's body.
+    type: object = msgspec.UNSET
+
+
+_CONTROL_ROUTE_DECODER = msgspec.msgpack.Decoder(_ControlRoute)
+
+
+def _decode_control_message(message: bytes) -> _ControlMessage | bytes:
+    """Decode a typed peer message; an untagged hint envelope stays undecoded."""
+    try:
+        return _CONTROL_DECODER.decode(message)
+    except msgspec.ValidationError:
+        if _CONTROL_ROUTE_DECODER.decode(message).type is not msgspec.UNSET:
+            raise
+        return message
+
+
 # Known reasons map identically for whole-write failures and unserved blocks.
 _STATUS_BY_REASON = {
     Reason.NOT_RESIDENT: OpEntryStatus.UNAVAILABLE,
@@ -554,6 +572,7 @@ class _SourceWriteOp(_RemoteOp):
     src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     # Retain the source restriction across progress retries and owner admission.
     g2_only: bool = False
+    uncertain: bool = False
     transfer_id: int | None = None
     success: bool = False
     completed_indices: tuple[int, ...] = ()
@@ -563,7 +582,7 @@ class _SourceWriteOp(_RemoteOp):
     moving: tuple[BlockKey, ...] = ()
     # None means copy; else the keys to evict by layout, set at source preparation.
     evictions: dict[tuple[str, ...], list[BlockKey]] | None = None
-    # None uses caller cleanup; a tuple (even empty) is owned by progress.
+    # None uses caller cleanup; tuples use progress until uncertainty is reported.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
     # Reported to the target: why the operation failed, or why requested
     # indices were left out of completed_indices.
